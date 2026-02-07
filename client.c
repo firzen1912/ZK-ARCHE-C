@@ -17,7 +17,8 @@
 #define DEVICE_X_FILE  "device_x.bin"
 
 // Demo constant server identity binding (same as Rust)
-static const uint8_t SERVER_ID[32] = { 0x53 };
+static const uint8_t SERVER_ID[32] = { [0 ... 31] = 0x53 };
+
 
 // -----------------------------
 // File helpers
