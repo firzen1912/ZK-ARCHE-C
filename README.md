@@ -34,8 +34,15 @@ sudo apt install build-essential libsodium-dev
 
 ## 2. Compile
 
+Compile client:
+
 ``` bash
 gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium
+```
+
+Compile server:
+
+``` bash
 gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium
 ```
 
