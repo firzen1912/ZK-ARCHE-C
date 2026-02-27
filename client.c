@@ -1,9 +1,14 @@
+#define _POSIX_C_SOURCE 200112L
+
 #include <sodium.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
