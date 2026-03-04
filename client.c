@@ -1,37 +1,12 @@
 // ==============================
-// c_client.c  (DESIGN A: TOFU pin server pubkey + KEY CONFIRMATION MACs)
+// c_client.c  (V2: Zero Privacy + TOFU Pinning & Key Confirmation)
 // ==============================
 //
-// Wire protocol (1-byte msg_type):
-//   MSG_SETUP = 0x01
-//     C->S: 0x01 | token_len(u8)=0 | device_id(32) | device_static_pub(32)
-//     S->C: server_static_pub(32) | server_nonce(32)
-//     C->S: A(32) | s(32)
-//           Schnorr PoP over transcript("setup_schnorr_v1"):
-//             device_id, pubkey(device_pub), A, server_nonce
-//
-//   MSG_AUTH  = 0x02
-//     C->S: 0x02 | device_id(32) | A_c(32) | s_c(32) | nonce_c(32) | eph_c(32)
-//     S->C: server_static_pub(32) | A_s(32) | s_s(32) | nonce_s(32) | eph_s(32) | tag_s(32)
-//     C->S: tag_c(32)
-//
-// Client files:
-//   device_id.bin   (32 bytes)
-//   device_x.bin    (32 bytes scalar)
-//   server_pub.bin  (32 bytes)  <-- pinned server identity (TOFU)
-//
-// Transcript encoding (C-compatible, no Merlin):
-//   domain_len(u8)||domain
-//   for each field: label_len(u8)||label||value_len(u32 LE)||value
-//
-// Schnorr challenge scalar:
-//   c = scalar_reduce(SHA512(transcript))
-//
-// Key confirmation:
-//   th = SHA256( transcript("kc_v1", ... all handshake fields ...) )
-//   (k_s2c, k_c2s) = HKDF-Expand(salt=th, ikm=session_key, info="kc s2c"/"kc c2s")
-//   tag_s = HMAC(k_s2c, "server finished" || th)
-//   tag_c = HMAC(k_c2s, "client finished" || th)
+// Goals:
+//   1) Record server identity via TOFU or out-of-band pinning (--pin-server-pub).
+//   2) Enforce pinned server_static_pub during SETUP and AUTH (reject MITM).
+//   3) Zero Privacy: Hide identity (device_id) during AUTH using X25519 ECDHE tunnel.
+//   4) Add key confirmation MACs: "server finished" and "client finished".
 //
 // Build:
 //   gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium
@@ -43,6 +18,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -53,7 +29,7 @@
 // Protocol constants
 // -----------------------------
 #define MSG_SETUP 0x01
-#define MSG_AUTH  0x02
+#define MSG_AUTH_V2 0x03
 
 #define DEVICE_ID_FILE  "device_id.bin"
 #define DEVICE_X_FILE   "device_x.bin"
@@ -81,8 +57,14 @@ static int write_file_32(const char *path, const uint8_t in[32]) {
 }
 
 // -----------------------------
-// TCP helpers
+// Timing + TCP helpers
 // -----------------------------
+static double get_time_sec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 static int tcp_connect(const char *hostport) {
     char host[256] = {0};
     char port[32] = {0};
@@ -115,23 +97,41 @@ static int tcp_connect(const char *hostport) {
     return fd;
 }
 
-static int send_all(int fd, const uint8_t *buf, size_t len) {
+static int send_all(int fd, const uint8_t *buf, size_t len, size_t *sent_tracker) {
     size_t off = 0;
     while (off < len) {
         ssize_t n = send(fd, buf + off, len - off, 0);
         if (n <= 0) return -1;
         off += (size_t)n;
     }
+    if (sent_tracker) *sent_tracker += len;
     return 0;
 }
 
-static int recv_all(int fd, uint8_t *buf, size_t len) {
+static int recv_all(int fd, uint8_t *buf, size_t len, size_t *recv_tracker) {
     size_t off = 0;
     while (off < len) {
         ssize_t n = recv(fd, buf + off, len - off, 0);
         if (n <= 0) return -1;
         off += (size_t)n;
     }
+    if (recv_tracker) *recv_tracker += len;
+    return 0;
+}
+
+static void send_len(int fd, uint32_t val, size_t *sent_tracker) {
+    uint8_t buf[4];
+    buf[0] = (uint8_t)(val & 0xFF);
+    buf[1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[3] = (uint8_t)((val >> 24) & 0xFF);
+    send_all(fd, buf, 4, sent_tracker);
+}
+
+static int recv_len(int fd, uint32_t *val, size_t *recv_tracker) {
+    uint8_t buf[4];
+    if (recv_all(fd, buf, 4, recv_tracker) != 0) return -1;
+    *val = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
     return 0;
 }
 
@@ -156,7 +156,6 @@ static void tr_append(transcript_t *tr, const char *label, const uint8_t *val, u
     size_t llen = strlen(label);
     if (llen > 255) { fprintf(stderr, "label too long\n"); exit(1); }
 
-    // Defensive: ensure transcript does not overflow fixed buffer
     if (tr->len + 1 + llen + 4 + (size_t)vlen > sizeof(tr->buf)) {
         fprintf(stderr, "transcript overflow\n");
         exit(1);
@@ -166,7 +165,6 @@ static void tr_append(transcript_t *tr, const char *label, const uint8_t *val, u
     memcpy(tr->buf + tr->len, label, llen);
     tr->len += llen;
 
-    // u32 little-endian length
     tr->buf[tr->len++] = (uint8_t)(vlen);
     tr->buf[tr->len++] = (uint8_t)(vlen >> 8);
     tr->buf[tr->len++] = (uint8_t)(vlen >> 16);
@@ -184,7 +182,6 @@ static void tr_challenge_scalar(uint8_t c_out[32], const transcript_t *tr) {
 
 // -----------------------------
 // Schnorr proofs (client) + server verify
-// Verify: s*G == A + c*X
 // -----------------------------
 static void schnorr_prove_setup(uint8_t A[32], uint8_t s[32],
                                 const uint8_t x[32],
@@ -240,11 +237,6 @@ static void schnorr_prove_auth(uint8_t A[32], uint8_t s[32],
     sodium_memzero(c, sizeof c);
 }
 
-// Server verify (Design A): bind pubkey + A + nonce_s + eph_s
-//
-// IMPORTANT:
-// crypto_scalarmult_ristretto255() can fail if server_pub is not a valid
-// Ristretto point. Always check return value.
 static int schnorr_verify_server(const uint8_t server_pub[32],
                                  const uint8_t A[32],
                                  const uint8_t s[32],
@@ -260,23 +252,18 @@ static int schnorr_verify_server(const uint8_t server_pub[32],
     tr_append(&tr, "eph_s", eph_s, 32);
 
     tr_challenge_scalar(c, &tr);
-
-    // left = s*G
     crypto_scalarmult_ristretto255_base(left, s);
 
-    // cX = c * server_pub  (must succeed)
     if (crypto_scalarmult_ristretto255(cX, c, server_pub) != 0) {
         return -1;
     }
 
-    // right = A + cX
     crypto_core_ristretto255_add(right, A, cX);
-
     return sodium_memcmp(left, right, 32) == 0 ? 0 : -1;
 }
 
 // -----------------------------
-// HKDF-SHA256 (RFC5869) using HMAC-SHA256
+// HKDF-SHA256
 // -----------------------------
 static void hkdf_extract(uint8_t prk[32], const uint8_t *salt, size_t salt_len,
                          const uint8_t *ikm, size_t ikm_len) {
@@ -310,13 +297,6 @@ static void hkdf_expand(uint8_t *okm, size_t okm_len, const uint8_t prk[32],
     sodium_memzero(t, sizeof t);
 }
 
-// -----------------------------
-// Session key derivation (returns error if eph_s invalid)
-//
-// shared = eph_secret * eph_s
-// salt   = nonce_c || nonce_s
-// info   = "session key" || device_id || eph_c || eph_s
-// -----------------------------
 static int derive_session_key(uint8_t key[32],
                               const uint8_t eph_secret[32],
                               const uint8_t eph_s[32],
@@ -325,8 +305,6 @@ static int derive_session_key(uint8_t key[32],
                               const uint8_t device_id[32],
                               const uint8_t eph_c[32]) {
     uint8_t shared[32];
-
-    // IMPORTANT: eph_s comes from network; reject invalid points.
     if (crypto_scalarmult_ristretto255(shared, eph_secret, eph_s) != 0) {
         sodium_memzero(shared, sizeof shared);
         return -1;
@@ -399,39 +377,40 @@ static void hmac_tag(uint8_t out[32], const uint8_t key[32], const char *label, 
 }
 
 // -----------------------------
-// Setup + Auth flows
+// Setup Flow
 // -----------------------------
 static int do_setup(const char *server, const uint8_t device_id[32], const uint8_t x[32]) {
+    double start_time = get_time_sec();
+    size_t sent = 0, recv = 0;
+
     int fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); return -1; }
+    
+    printf("Client[SETUP]: Connected to %s\n", server);
 
     uint8_t device_pub[32];
     crypto_scalarmult_ristretto255_base(device_pub, x);
 
-    // 1) Send SETUP header
     uint8_t msg = MSG_SETUP;
     uint8_t toklen = 0;
-    if (send_all(fd, &msg, 1) != 0) { close(fd); return -1; }
-    if (send_all(fd, &toklen, 1) != 0) { close(fd); return -1; }
+    if (send_all(fd, &msg, 1, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, &toklen, 1, &sent) != 0) { close(fd); return -1; }
 
-    // 2) Send device_id + device_pub
-    if (send_all(fd, device_id, 32) != 0) { close(fd); return -1; }
-    if (send_all(fd, device_pub, 32) != 0) { close(fd); return -1; }
+    if (send_all(fd, device_id, 32, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, device_pub, 32, &sent) != 0) { close(fd); return -1; }
 
-    // 3) Receive server_static_pub + server_nonce
     uint8_t server_pub[32];
     uint8_t server_nonce[32];
-    if (recv_all(fd, server_pub, 32) != 0) { close(fd); return -1; }
-    if (recv_all(fd, server_nonce, 32) != 0) { close(fd); return -1; }
+    if (recv_all(fd, server_pub, 32, &recv) != 0) { close(fd); return -1; }
+    if (recv_all(fd, server_nonce, 32, &recv) != 0) { close(fd); return -1; }
 
-    // 4) TOFU pin server pubkey
     if (!file_exists(SERVER_PUB_FILE)) {
         if (write_file_32(SERVER_PUB_FILE, server_pub) != 0) {
             fprintf(stderr, "failed to write %s\n", SERVER_PUB_FILE);
             close(fd);
             return -1;
         }
-        printf("C Client[SETUP]: pinned server_pub -> %s\n", SERVER_PUB_FILE);
+        printf("Client[SETUP]: Pinning server pubkey (TOFU) to %s\n", SERVER_PUB_FILE);
     } else {
         uint8_t pinned[32];
         if (read_file_32(SERVER_PUB_FILE, pinned) != 0) {
@@ -440,26 +419,36 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
             return -1;
         }
         if (sodium_memcmp(pinned, server_pub, 32) != 0) {
-            fprintf(stderr, "server pubkey mismatch vs pinned (refuse setup)\n");
+            fprintf(stderr, "MITM ALERT: Server offered a different public key than our pinned key!\n");
             close(fd);
             return -1;
         }
-        printf("C Client[SETUP]: server_pub matches pinned\n");
+        printf("Client[SETUP]: Server pubkey matches pinned value.\n");
     }
 
-    // 5) Send Schnorr PoP for device key
     uint8_t A[32], s[32];
     schnorr_prove_setup(A, s, x, device_id, device_pub, server_nonce);
-    if (send_all(fd, A, 32) != 0) { close(fd); return -1; }
-    if (send_all(fd, s, 32) != 0) { close(fd); return -1; }
-
+    if (send_all(fd, A, 32, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, s, 32, &sent) != 0) { close(fd); return -1; }
     close(fd);
-    printf("C Client[SETUP]: OK\n");
+
+    char hex_id[65];
+    sodium_bin2hex(hex_id, sizeof(hex_id), device_id, 32);
+
+    double duration = get_time_sec() - start_time;
+    printf("Client[SETUP]: Sent=%zu bytes, Received=%zu bytes. Enrolled device_id=%s\n", sent, recv, hex_id);
+    printf("CLIENT METRICS -> Duration: %.3fms\n", duration * 1000.0);
+
     return 0;
 }
 
-static int do_auth(const char *server, const uint8_t device_id[32], const uint8_t x[32]) {
-    // Must have pinned server identity for Design A
+// -----------------------------
+// Auth Flow V2 (Encrypted Zero-Privacy Tunnel)
+// -----------------------------
+static int do_auth_v2(const char *server, const uint8_t device_id[32], const uint8_t x[32]) {
+    double start_time = get_time_sec();
+    size_t sent = 0, recv = 0;
+
     uint8_t pinned_server_pub[32];
     if (read_file_32(SERVER_PUB_FILE, pinned_server_pub) != 0) {
         fprintf(stderr, "Missing %s; run with --setup first\n", SERVER_PUB_FILE);
@@ -468,64 +457,120 @@ static int do_auth(const char *server, const uint8_t device_id[32], const uint8_
 
     int fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); return -1; }
+    
+    printf("Client[AUTH]: Connected to %s\n", server);
 
+    // 1. ANONYMOUS EPHEMERAL KEY EXCHANGE (ECDHE)
+    uint8_t client_sk[crypto_kx_SECRETKEYBYTES];
+    uint8_t client_pk[crypto_kx_PUBLICKEYBYTES];
+    crypto_kx_keypair(client_pk, client_sk); // Safe X25519 keypair
+
+    uint8_t msg = MSG_AUTH_V2;
+    if (send_all(fd, &msg, 1, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, client_pk, 32, &sent) != 0) { close(fd); return -1; }
+
+    uint8_t server_pk[32];
+    if (recv_all(fd, server_pk, 32, &recv) != 0) { close(fd); return -1; }
+
+    uint8_t shared_secret[32];
+    if (crypto_scalarmult(shared_secret, client_sk, server_pk) != 0) {
+        fprintf(stderr, "Client[AUTH]: Invalid server X25519 key\n");
+        close(fd); return -1;
+    }
+
+    uint8_t hash[64];
+    crypto_generichash_state st;
+    crypto_generichash_init(&st, NULL, 0, 64);
+    crypto_generichash_update(&st, shared_secret, 32);
+    crypto_generichash_update(&st, client_pk, 32);
+    crypto_generichash_update(&st, server_pk, 32);
+    crypto_generichash_final(&st, hash, 64);
+
+    uint8_t rx_key[32], tx_key[32];
+    memcpy(rx_key, hash, 32);      // Client rx is hash[0..32]
+    memcpy(tx_key, hash + 32, 32); // Client tx is hash[32..64]
+
+    // 2. ENCRYPT IDENTITY AND SCHNORR PROOF
     uint8_t device_pub[32];
     crypto_scalarmult_ristretto255_base(device_pub, x);
 
-    // Client nonce
     uint8_t nonce_c[32];
     randombytes_buf(nonce_c, 32);
 
-    // Client ephemeral ECDH key
     uint8_t eph_secret[32], eph_c[32];
     crypto_core_ristretto255_scalar_random(eph_secret);
     crypto_scalarmult_ristretto255_base(eph_c, eph_secret);
 
-    // Client Schnorr proof (A_c, s_c)
     uint8_t A_c[32], s_c[32];
     schnorr_prove_auth(A_c, s_c, x, device_id, device_pub, nonce_c, eph_c);
 
-    // Send AUTH request
-    uint8_t msg = MSG_AUTH;
-    if (send_all(fd, &msg, 1) != 0) { close(fd); return -1; }
-    if (send_all(fd, device_id, 32) != 0) { close(fd); return -1; }
-    if (send_all(fd, A_c, 32) != 0) { close(fd); return -1; }
-    if (send_all(fd, s_c, 32) != 0) { close(fd); return -1; }
-    if (send_all(fd, nonce_c, 32) != 0) { close(fd); return -1; }
-    if (send_all(fd, eph_c, 32) != 0) { close(fd); return -1; }
+    uint8_t payload1[160];
+    memcpy(payload1, device_id, 32);
+    memcpy(payload1 + 32, A_c, 32);
+    memcpy(payload1 + 64, s_c, 32);
+    memcpy(payload1 + 96, nonce_c, 32);
+    memcpy(payload1 + 128, eph_c, 32);
 
-    // Receive server response
+    uint8_t nonce_tx_1[crypto_aead_chacha20poly1305_IETF_NPUBBYTES] = {0};
+    uint8_t ct1[160 + crypto_aead_chacha20poly1305_IETF_ABYTES];
+    unsigned long long ct1_len;
+
+    crypto_aead_chacha20poly1305_ietf_encrypt(ct1, &ct1_len, payload1, sizeof(payload1), 
+                                              NULL, 0, NULL, nonce_tx_1, tx_key);
+
+    send_len(fd, (uint32_t)ct1_len, &sent);
+    if (send_all(fd, ct1, (size_t)ct1_len, &sent) != 0) { close(fd); return -1; }
+
+    // 3. READ ENCRYPTED SERVER RESPONSE
+    uint32_t rx_len;
+    if (recv_len(fd, &rx_len, &recv) != 0) { close(fd); return -1; }
+
+    uint8_t *rx_ct = malloc(rx_len);
+    if (!rx_ct || recv_all(fd, rx_ct, rx_len, &recv) != 0) { 
+        free(rx_ct); close(fd); return -1; 
+    }
+
+    uint8_t pt2[192];
+    unsigned long long pt2_len;
+    uint8_t nonce_rx_1[crypto_aead_chacha20poly1305_IETF_NPUBBYTES] = {0};
+
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(pt2, &pt2_len, NULL, rx_ct, rx_len, 
+                                                  NULL, 0, nonce_rx_1, rx_key) != 0) {
+        fprintf(stderr, "Client[AUTH]: Server payload decryption failed\n");
+        free(rx_ct); close(fd); return -1;
+    }
+    free(rx_ct);
+
+    if (pt2_len != 192) {
+        fprintf(stderr, "Client[AUTH]: Invalid server payload size\n");
+        close(fd); return -1;
+    }
+
     uint8_t server_pub[32], A_s[32], s_s[32], nonce_s[32], eph_s[32], tag_s[32];
-    if (recv_all(fd, server_pub, 32) != 0) { close(fd); return -1; }
+    memcpy(server_pub, pt2, 32);
+    memcpy(A_s, pt2 + 32, 32);
+    memcpy(s_s, pt2 + 64, 32);
+    memcpy(nonce_s, pt2 + 96, 32);
+    memcpy(eph_s, pt2 + 128, 32);
+    memcpy(tag_s, pt2 + 160, 32);
 
-    // Enforce TOFU-pinned server identity
     if (sodium_memcmp(server_pub, pinned_server_pub, 32) != 0) {
-        fprintf(stderr, "server pubkey mismatch vs pinned (refuse auth)\n");
-        close(fd);
-        return -1;
+        fprintf(stderr, "Client[AUTH]: Server pubkey mismatch vs pinned (refuse auth)\n");
+        close(fd); return -1;
     }
 
-    if (recv_all(fd, A_s, 32) != 0) { close(fd); return -1; }
-    if (recv_all(fd, s_s, 32) != 0) { close(fd); return -1; }
-    if (recv_all(fd, nonce_s, 32) != 0) { close(fd); return -1; }
-    if (recv_all(fd, eph_s, 32) != 0) { close(fd); return -1; }
-    if (recv_all(fd, tag_s, 32) != 0) { close(fd); return -1; }
-
-    // Verify server Schnorr proof
     if (schnorr_verify_server(server_pub, A_s, s_s, nonce_s, eph_s) != 0) {
-        fprintf(stderr, "C Client[AUTH]: server proof invalid\n");
-        close(fd);
-        return -1;
+        fprintf(stderr, "Client[AUTH]: Authentication FAILED\n");
+        close(fd); return -1;
     }
+    printf("Client[AUTH]: Server Schnorr authentication = true\n");
 
-    // Derive session key (reject invalid eph_s points)
     uint8_t session_key[32];
     if (derive_session_key(session_key, eph_secret, eph_s, nonce_c, nonce_s, device_id, eph_c) != 0) {
-        fprintf(stderr, "C Client[AUTH]: invalid eph_s point\n");
-        close(fd);
-        return -1;
+        fprintf(stderr, "Client[AUTH]: invalid eph_s point\n");
+        close(fd); return -1;
     }
-
+    
     // -------- Key Confirmation --------
     uint8_t th[32];
     kc_transcript_hash(th, device_id, A_c, s_c, nonce_c, eph_c, server_pub, A_s, s_s, nonce_s, eph_s);
@@ -533,28 +578,41 @@ static int do_auth(const char *server, const uint8_t device_id[32], const uint8_
     uint8_t k_s2c[32], k_c2s[32];
     derive_kc_keys(k_s2c, k_c2s, session_key, th);
 
-    // Verify tag_s
     uint8_t expected_s[32];
     hmac_tag(expected_s, k_s2c, "server finished", th);
     if (sodium_memcmp(expected_s, tag_s, 32) != 0) {
-        fprintf(stderr, "C Client[AUTH]: server key confirmation failed\n");
-        close(fd);
-        return -1;
+        fprintf(stderr, "Client[AUTH]: server key confirmation failed (tag_s mismatch)\n");
+        close(fd); return -1;
     }
+    printf("Client[AUTH]: Key confirmation (server finished) OK\n");
 
-    // Send tag_c
+    // 4. SEND ENCRYPTED CLIENT CONFIRMATION (tag_c)
     uint8_t tag_c[32];
     hmac_tag(tag_c, k_c2s, "client finished", th);
-    if (send_all(fd, tag_c, 32) != 0) { close(fd); return -1; }
 
-    printf("C Client[AUTH]: OK, session key = ");
-    for (int i = 0; i < 32; i++) printf("%02x", session_key[i]);
-    printf("\n");
+    uint8_t nonce_tx_2[crypto_aead_chacha20poly1305_IETF_NPUBBYTES] = {0};
+    nonce_tx_2[0] = 1; // Increment nonce!
+
+    uint8_t ct3[32 + crypto_aead_chacha20poly1305_IETF_ABYTES];
+    unsigned long long ct3_len;
+    crypto_aead_chacha20poly1305_ietf_encrypt(ct3, &ct3_len, tag_c, 32, 
+                                              NULL, 0, NULL, nonce_tx_2, tx_key);
+
+    send_len(fd, (uint32_t)ct3_len, &sent);
+    if (send_all(fd, ct3, (size_t)ct3_len, &sent) != 0) { close(fd); return -1; }
+    printf("Client[AUTH]: Sent encrypted client finished tag\n");
+
+    double duration = get_time_sec() - start_time;
+    printf("CLIENT METRICS -> Duration: %.3fms, Sent: %zu bytes, Received: %zu bytes\n", duration * 1000.0, sent, recv);
 
     sodium_memzero(eph_secret, 32);
     sodium_memzero(session_key, 32);
     sodium_memzero(k_s2c, 32);
     sodium_memzero(k_c2s, 32);
+    sodium_memzero(client_sk, 32);
+    sodium_memzero(shared_secret, 32);
+    sodium_memzero(tx_key, 32);
+    sodium_memzero(rx_key, 32);
 
     close(fd);
     return 0;
@@ -567,6 +625,7 @@ static void usage(const char *p) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s --server 127.0.0.1:4000 --setup\n", p);
     fprintf(stderr, "  %s --server 127.0.0.1:4000\n", p);
+    fprintf(stderr, "  %s --pin-server-pub <hex_string>\n", p);
 }
 
 int main(int argc, char **argv) {
@@ -580,6 +639,19 @@ int main(int argc, char **argv) {
             server = argv[++i];
         } else if (!strcmp(argv[i], "--setup")) {
             setup = 1;
+        } else if (!strcmp(argv[i], "--pin-server-pub") && i + 1 < argc) {
+            const char *hex_str = argv[++i];
+            uint8_t pinned[32];
+            size_t bin_len;
+            if (sodium_hex2bin(pinned, sizeof(pinned), hex_str, strlen(hex_str), NULL, &bin_len, NULL) != 0 || bin_len != 32) {
+                fprintf(stderr, "Client: invalid hex for pinned key\n");
+                return 1;
+            }
+            if (write_file_32(SERVER_PUB_FILE, pinned) != 0) {
+                fprintf(stderr, "Client: failed to write pinned key\n");
+                return 1;
+            }
+            printf("Client: Successfully pinned server pubkey out-of-band.\n");
         } else {
             usage(argv[0]);
             return 1;
@@ -588,12 +660,12 @@ int main(int argc, char **argv) {
 
     uint8_t device_id[32], x[32];
 
-    // Create or load device identity
     if (!file_exists(DEVICE_ID_FILE) || !file_exists(DEVICE_X_FILE)) {
         if (!setup) {
-            fprintf(stderr, "Missing device creds; run with --setup\n");
+            fprintf(stderr, "Client: device creds missing (%s / %s). Refusing AUTH. Run with --setup to enroll.\n", DEVICE_ID_FILE, DEVICE_X_FILE);
             return 0;
         }
+        printf("Client[SETUP]: No creds found; generating NEW device identity (re-enroll).\n");
         randombytes_buf(device_id, 32);
         crypto_core_ristretto255_scalar_random(x);
         if (write_file_32(DEVICE_ID_FILE, device_id) != 0 ||
@@ -602,6 +674,9 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
+        if (setup) {
+            printf("Client[SETUP]: Using existing creds for setup (idempotent).\n");
+        }
         if (read_file_32(DEVICE_ID_FILE, device_id) != 0 ||
             read_file_32(DEVICE_X_FILE, x) != 0) {
             fprintf(stderr, "Failed reading device creds\n");
@@ -609,7 +684,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    int rc = setup ? do_setup(server, device_id, x) : do_auth(server, device_id, x);
+    int rc = setup ? do_setup(server, device_id, x) : do_auth_v2(server, device_id, x);
     sodium_memzero(x, 32);
     return (rc == 0) ? 0 : 1;
 }
