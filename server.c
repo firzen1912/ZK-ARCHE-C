@@ -33,6 +33,11 @@
 // Replay cache params
 #define REPLAY_MAX 50000
 
+// Pairing policy
+typedef struct {
+    int enabled;
+} pairing_policy_t;
+
 // -----------------------------
 // File helpers
 // -----------------------------
@@ -506,7 +511,8 @@ static int parse_bind(const char *bind, char ip[64], uint16_t *port) {
 static void handle_client(int cfd, const char *peer,
                           reg_entry_t **reg, size_t *reg_n,
                           const uint8_t server_sk[32],
-                          const uint8_t server_pub[32]) {
+                          const uint8_t server_pub[32],
+                          const pairing_policy_t *policy) {
     double start_time = get_time_sec();
     size_t sent = 0, recv = 0;
     uint8_t msg_type;
@@ -524,6 +530,11 @@ static void handle_client(int cfd, const char *peer,
             if (!tmp) goto cleanup;
             if (recv_all(cfd, tmp, tlen, &recv) != 0) { free(tmp); goto cleanup; }
             free(tmp);
+        }
+
+        if (!policy || !policy->enabled) {
+            fprintf(stderr, "Server[SETUP]: pairing not allowed\n");
+            goto cleanup;
         }
 
         uint8_t device_id[32], device_pub[32];
@@ -741,9 +752,11 @@ int main(int argc, char **argv) {
     if (sodium_init() < 0) return 1;
 
     const char *bind_str = "0.0.0.0:4000";
+    pairing_policy_t policy = {0};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_str = argv[++i];
-        else { fprintf(stderr, "Usage: %s --bind 0.0.0.0:4000\n", argv[0]); return 1; }
+        else if (!strcmp(argv[i], "--pairing")) policy.enabled = 1;
+        else { fprintf(stderr, "Usage: %s --bind 0.0.0.0:4000 [--pairing]\n", argv[0]); return 1; }
     }
 
     char ip[64];
@@ -793,6 +806,6 @@ int main(int argc, char **argv) {
         char peer_str[64];
         snprintf(peer_str, sizeof(peer_str), "%s:%d", peer_ip, ntohs(peer_addr.sin_port));
 
-        handle_client(cfd, peer_str, &reg, &reg_n, server_sk, server_pub);
+        handle_client(cfd, peer_str, &reg, &reg_n, server_sk, server_pub, &policy);
     }
 }

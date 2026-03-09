@@ -1,16 +1,3 @@
-// ==============================
-// c_client.c  (V2: Zero Privacy + TOFU Pinning & Key Confirmation)
-// ==============================
-//
-// Goals:
-//   1) Record server identity via TOFU or out-of-band pinning (--pin-server-pub).
-//   2) Enforce pinned server_static_pub during SETUP and AUTH (reject MITM).
-//   3) Zero Privacy: Hide identity (device_id) during AUTH using X25519 ECDHE tunnel.
-//   4) Add key confirmation MACs: "server finished" and "client finished".
-//
-// Build:
-//   gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium
-//
 #define _POSIX_C_SOURCE 200112L
 #include <sodium.h>
 #include <stdio.h>
@@ -19,6 +6,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -31,14 +20,31 @@
 #define MSG_SETUP 0x01
 #define MSG_AUTH_V2 0x03
 
-#define DEVICE_ID_FILE  "device_id.bin"
-#define DEVICE_X_FILE   "device_x.bin"
-#define SERVER_PUB_FILE "server_pub.bin"
+#define STATE_DIR        "."
+#define DEVICE_ROOT_FILE "device_root.bin"
+#define SERVER_PUB_FILE  "server_pub.bin"
 
 // -----------------------------
-// File helpers
+// File + directory helpers
 // -----------------------------
 static int file_exists(const char *path) { return access(path, F_OK) == 0; }
+
+static int ensure_state_dir(void) {
+    struct stat st;
+    if (stat(STATE_DIR, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            errno = ENOTDIR;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (mkdir(STATE_DIR, 0700) == 0) {
+        return 0;
+    }
+
+    return -1;
+}
 
 static int read_file_32(const char *path, uint8_t out[32]) {
     FILE *f = fopen(path, "rb");
@@ -49,11 +55,66 @@ static int read_file_32(const char *path, uint8_t out[32]) {
 }
 
 static int write_file_32(const char *path, const uint8_t in[32]) {
+    if (ensure_state_dir() != 0) return -1;
+
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     size_t n = fwrite(in, 1, 32, f);
     fclose(f);
-    return (n == 32) ? 0 : -1;
+    if (n != 32) return -1;
+
+    if (chmod(path, 0600) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+// -----------------------------
+// Root-secret model
+// -----------------------------
+static int load_or_create_device_root(uint8_t root[32], int *created) {
+    if (file_exists(DEVICE_ROOT_FILE)) {
+        if (read_file_32(DEVICE_ROOT_FILE, root) != 0) return -1;
+        if (created) *created = 0;
+        return 0;
+    }
+
+    randombytes_buf(root, 32);
+    if (write_file_32(DEVICE_ROOT_FILE, root) != 0) return -1;
+    if (created) *created = 1;
+    return 0;
+}
+
+static void derive_device_id(const uint8_t root[32], uint8_t device_id[32]) {
+    crypto_generichash_state st;
+    crypto_generichash_init(&st, NULL, 0, 32);
+    crypto_generichash_update(&st, (const unsigned char *)"device-id", 9);
+    crypto_generichash_update(&st, root, 32);
+    crypto_generichash_final(&st, device_id, 32);
+}
+
+static void derive_device_scalar(const uint8_t root[32], uint8_t x[32]) {
+    uint8_t wide[64];
+    crypto_generichash_state st;
+    crypto_generichash_init(&st, NULL, 0, 64);
+    crypto_generichash_update(&st, (const unsigned char *)"device-auth-v1", 14);
+    crypto_generichash_update(&st, root, 32);
+    crypto_generichash_final(&st, wide, 64);
+    crypto_core_ristretto255_scalar_reduce(x, wide);
+    sodium_memzero(wide, sizeof wide);
+}
+
+static int load_device_creds_from_root(uint8_t device_id[32], uint8_t x[32], int *created_root) {
+    uint8_t root[32];
+    if (load_or_create_device_root(root, created_root) != 0) return -1;
+    derive_device_id(root, device_id);
+    derive_device_scalar(root, x);
+    sodium_memzero(root, sizeof root);
+    return 0;
+}
+
+static int creds_exist(void) {
+    return file_exists(DEVICE_ROOT_FILE);
 }
 
 // -----------------------------
@@ -385,7 +446,7 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
 
     int fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); return -1; }
-    
+
     printf("Client[SETUP]: Connected to %s\n", server);
 
     uint8_t device_pub[32];
@@ -457,13 +518,13 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
 
     int fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); return -1; }
-    
+
     printf("Client[AUTH]: Connected to %s\n", server);
 
     // 1. ANONYMOUS EPHEMERAL KEY EXCHANGE (ECDHE)
     uint8_t client_sk[crypto_kx_SECRETKEYBYTES];
     uint8_t client_pk[crypto_kx_PUBLICKEYBYTES];
-    crypto_kx_keypair(client_pk, client_sk); // Safe X25519 keypair
+    crypto_kx_keypair(client_pk, client_sk);
 
     uint8_t msg = MSG_AUTH_V2;
     if (send_all(fd, &msg, 1, &sent) != 0) { close(fd); return -1; }
@@ -487,8 +548,8 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
     crypto_generichash_final(&st, hash, 64);
 
     uint8_t rx_key[32], tx_key[32];
-    memcpy(rx_key, hash, 32);      // Client rx is hash[0..32]
-    memcpy(tx_key, hash + 32, 32); // Client tx is hash[32..64]
+    memcpy(rx_key, hash, 32);
+    memcpy(tx_key, hash + 32, 32);
 
     // 2. ENCRYPT IDENTITY AND SCHNORR PROOF
     uint8_t device_pub[32];
@@ -515,7 +576,7 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
     uint8_t ct1[160 + crypto_aead_chacha20poly1305_IETF_ABYTES];
     unsigned long long ct1_len;
 
-    crypto_aead_chacha20poly1305_ietf_encrypt(ct1, &ct1_len, payload1, sizeof(payload1), 
+    crypto_aead_chacha20poly1305_ietf_encrypt(ct1, &ct1_len, payload1, sizeof(payload1),
                                               NULL, 0, NULL, nonce_tx_1, tx_key);
 
     send_len(fd, (uint32_t)ct1_len, &sent);
@@ -526,15 +587,15 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
     if (recv_len(fd, &rx_len, &recv) != 0) { close(fd); return -1; }
 
     uint8_t *rx_ct = malloc(rx_len);
-    if (!rx_ct || recv_all(fd, rx_ct, rx_len, &recv) != 0) { 
-        free(rx_ct); close(fd); return -1; 
+    if (!rx_ct || recv_all(fd, rx_ct, rx_len, &recv) != 0) {
+        free(rx_ct); close(fd); return -1;
     }
 
     uint8_t pt2[192];
     unsigned long long pt2_len;
     uint8_t nonce_rx_1[crypto_aead_chacha20poly1305_IETF_NPUBBYTES] = {0};
 
-    if (crypto_aead_chacha20poly1305_ietf_decrypt(pt2, &pt2_len, NULL, rx_ct, rx_len, 
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(pt2, &pt2_len, NULL, rx_ct, rx_len,
                                                   NULL, 0, nonce_rx_1, rx_key) != 0) {
         fprintf(stderr, "Client[AUTH]: Server payload decryption failed\n");
         free(rx_ct); close(fd); return -1;
@@ -570,8 +631,7 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
         fprintf(stderr, "Client[AUTH]: invalid eph_s point\n");
         close(fd); return -1;
     }
-    
-    // -------- Key Confirmation --------
+
     uint8_t th[32];
     kc_transcript_hash(th, device_id, A_c, s_c, nonce_c, eph_c, server_pub, A_s, s_s, nonce_s, eph_s);
 
@@ -591,11 +651,11 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
     hmac_tag(tag_c, k_c2s, "client finished", th);
 
     uint8_t nonce_tx_2[crypto_aead_chacha20poly1305_IETF_NPUBBYTES] = {0};
-    nonce_tx_2[0] = 1; // Increment nonce!
+    nonce_tx_2[0] = 1;
 
     uint8_t ct3[32 + crypto_aead_chacha20poly1305_IETF_ABYTES];
     unsigned long long ct3_len;
-    crypto_aead_chacha20poly1305_ietf_encrypt(ct3, &ct3_len, tag_c, 32, 
+    crypto_aead_chacha20poly1305_ietf_encrypt(ct3, &ct3_len, tag_c, 32,
                                               NULL, 0, NULL, nonce_tx_2, tx_key);
 
     send_len(fd, (uint32_t)ct3_len, &sent);
@@ -652,6 +712,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             printf("Client: Successfully pinned server pubkey out-of-band.\n");
+            return 0;
         } else {
             usage(argv[0]);
             return 1;
@@ -659,32 +720,28 @@ int main(int argc, char **argv) {
     }
 
     uint8_t device_id[32], x[32];
+    int created_root = 0;
 
-    if (!file_exists(DEVICE_ID_FILE) || !file_exists(DEVICE_X_FILE)) {
-        if (!setup) {
-            fprintf(stderr, "Client: device creds missing (%s / %s). Refusing AUTH. Run with --setup to enroll.\n", DEVICE_ID_FILE, DEVICE_X_FILE);
-            return 0;
-        }
-        printf("Client[SETUP]: No creds found; generating NEW device identity (re-enroll).\n");
-        randombytes_buf(device_id, 32);
-        crypto_core_ristretto255_scalar_random(x);
-        if (write_file_32(DEVICE_ID_FILE, device_id) != 0 ||
-            write_file_32(DEVICE_X_FILE, x) != 0) {
-            fprintf(stderr, "Failed writing device creds\n");
-            return 1;
-        }
-    } else {
-        if (setup) {
-            printf("Client[SETUP]: Using existing creds for setup (idempotent).\n");
-        }
-        if (read_file_32(DEVICE_ID_FILE, device_id) != 0 ||
-            read_file_32(DEVICE_X_FILE, x) != 0) {
-            fprintf(stderr, "Failed reading device creds\n");
-            return 1;
+    if (!creds_exist() && !setup) {
+        fprintf(stderr, "Client: device root missing (%s). Refusing AUTH. Run with --setup to enroll.\n", DEVICE_ROOT_FILE);
+        return 0;
+    }
+
+    if (load_device_creds_from_root(device_id, x, &created_root) != 0) {
+        fprintf(stderr, "Failed loading/creating device root\n");
+        return 1;
+    }
+
+    if (setup) {
+        if (created_root) {
+            printf("Client[SETUP]: No device root found; generating NEW device root (re-enroll).\n");
+        } else {
+            printf("Client[SETUP]: Using existing device root for setup (idempotent).\n");
         }
     }
 
     int rc = setup ? do_setup(server, device_id, x) : do_auth_v2(server, device_id, x);
     sodium_memzero(x, 32);
+    sodium_memzero(device_id, 32);
     return (rc == 0) ? 0 : 1;
 }
