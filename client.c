@@ -20,9 +20,13 @@
 #define MSG_SETUP 0x01
 #define MSG_AUTH_V2 0x03
 
-#define STATE_DIR        "."
-#define DEVICE_ROOT_FILE "device_root.bin"
-#define SERVER_PUB_FILE  "server_pub.bin"
+#define STATE_DIR              "/var/lib/iot-auth"
+#define DEVICE_ROOT_FILE       "/var/lib/iot-auth/device_root.bin"
+#define SERVER_PUB_FILE        "/var/lib/iot-auth/server_pub.bin"
+#define BOOTSTRAP_ID_FILE      "/var/lib/iot-auth/bootstrap_id.bin"
+#define BOOTSTRAP_SECRET_FILE  "/var/lib/iot-auth/bootstrap_secret.bin"
+#define BOOTSTRAP_ID_LEN       32
+#define BOOTSTRAP_SECRET_LEN   32
 
 // -----------------------------
 // File + directory helpers
@@ -117,6 +121,72 @@ static int creds_exist(void) {
     return file_exists(DEVICE_ROOT_FILE);
 }
 
+static int load_bootstrap_id(uint8_t out[BOOTSTRAP_ID_LEN]) {
+    return read_file_32(BOOTSTRAP_ID_FILE, out);
+}
+
+static int load_bootstrap_secret(uint8_t out[BOOTSTRAP_SECRET_LEN]) {
+    return read_file_32(BOOTSTRAP_SECRET_FILE, out);
+}
+
+static int save_bootstrap_material(const uint8_t id[BOOTSTRAP_ID_LEN],
+                                   const uint8_t secret[BOOTSTRAP_SECRET_LEN]) {
+    if (write_file_32(BOOTSTRAP_ID_FILE, id) != 0) return -1;
+    if (write_file_32(BOOTSTRAP_SECRET_FILE, secret) != 0) return -1;
+    return 0;
+}
+
+
+// -----------------------------
+// Transcript forward declarations
+// -----------------------------
+typedef struct {
+    uint8_t buf[4096];
+    size_t len;
+} transcript_t;
+
+static void tr_init(transcript_t *tr, const char *domain);
+static void tr_append(transcript_t *tr, const char *label, const uint8_t *val, uint32_t vlen);
+static void tr_challenge_scalar(uint8_t c_out[32], const transcript_t *tr);
+
+static void ztp_mac_transcript_hash(uint8_t out[32],
+                                    const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
+                                    const uint8_t device_id[32],
+                                    const uint8_t device_pub[32],
+                                    const uint8_t server_pub[32],
+                                    const uint8_t client_nonce[32],
+                                    const uint8_t server_nonce[32]) {
+    transcript_t tr;
+    tr_init(&tr, "ztp-bootstrap-v1");
+    tr_append(&tr, "bootstrap_id", bootstrap_id, BOOTSTRAP_ID_LEN);
+    tr_append(&tr, "device_id", device_id, 32);
+    tr_append(&tr, "device_pub", device_pub, 32);
+    tr_append(&tr, "server_pub", server_pub, 32);
+    tr_append(&tr, "client_nonce", client_nonce, 32);
+    tr_append(&tr, "server_nonce", server_nonce, 32);
+    crypto_hash_sha256(out, tr.buf, (unsigned long long)tr.len);
+}
+
+static void compute_bootstrap_mac(uint8_t out[32],
+                                  const uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN],
+                                  const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
+                                  const uint8_t device_id[32],
+                                  const uint8_t device_pub[32],
+                                  const uint8_t server_pub[32],
+                                  const uint8_t client_nonce[32],
+                                  const uint8_t server_nonce[32]) {
+    uint8_t th[32];
+    ztp_mac_transcript_hash(th, bootstrap_id, device_id, device_pub, server_pub, client_nonce, server_nonce);
+
+    crypto_auth_hmacsha256_state st;
+    crypto_auth_hmacsha256_init(&st, bootstrap_secret, BOOTSTRAP_SECRET_LEN);
+    crypto_auth_hmacsha256_update(&st, (const unsigned char *)"ztp-bootstrap-mac", 17);
+    crypto_auth_hmacsha256_update(&st, th, 32);
+    crypto_auth_hmacsha256_final(&st, out);
+
+    sodium_memzero(th, sizeof th);
+}
+
 // -----------------------------
 // Timing + TCP helpers
 // -----------------------------
@@ -199,11 +269,6 @@ static int recv_len(int fd, uint32_t *val, size_t *recv_tracker) {
 // -----------------------------
 // Transcript (Merlin replacement)
 // -----------------------------
-typedef struct {
-    uint8_t buf[4096];
-    size_t len;
-} transcript_t;
-
 static void tr_init(transcript_t *tr, const char *domain) {
     tr->len = 0;
     size_t dlen = strlen(domain);
@@ -444,62 +509,65 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
     double start_time = get_time_sec();
     size_t sent = 0, recv = 0;
 
+    uint8_t bootstrap_id[BOOTSTRAP_ID_LEN];
+    uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN];
+    uint8_t pinned_server_pub[32];
+
+    if (load_bootstrap_id(bootstrap_id) != 0 || load_bootstrap_secret(bootstrap_secret) != 0) {
+        fprintf(stderr, "Client[SETUP/ZTP]: Missing bootstrap_id/bootstrap_secret. Run with --provision-bootstrap first\n");
+        return -1;
+    }
+    if (read_file_32(SERVER_PUB_FILE, pinned_server_pub) != 0) {
+        fprintf(stderr, "Client[SETUP/ZTP]: ZTP setup requires a pinned %s; use --pin-server-pub first\n", SERVER_PUB_FILE);
+        return -1;
+    }
+
     int fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); return -1; }
 
-    printf("Client[SETUP]: Connected to %s\n", server);
+    printf("Client[SETUP/ZTP]: Connected to %s\n", server);
 
     uint8_t device_pub[32];
     crypto_scalarmult_ristretto255_base(device_pub, x);
 
-    uint8_t msg = MSG_SETUP;
-    uint8_t toklen = 0;
-    if (send_all(fd, &msg, 1, &sent) != 0) { close(fd); return -1; }
-    if (send_all(fd, &toklen, 1, &sent) != 0) { close(fd); return -1; }
+    uint8_t client_nonce[32];
+    randombytes_buf(client_nonce, 32);
 
+    uint8_t msg = MSG_SETUP;
+    uint8_t bid_len = BOOTSTRAP_ID_LEN;
+    if (send_all(fd, &msg, 1, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, &bid_len, 1, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, bootstrap_id, BOOTSTRAP_ID_LEN, &sent) != 0) { close(fd); return -1; }
     if (send_all(fd, device_id, 32, &sent) != 0) { close(fd); return -1; }
     if (send_all(fd, device_pub, 32, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, client_nonce, 32, &sent) != 0) { close(fd); return -1; }
 
     uint8_t server_pub[32];
     uint8_t server_nonce[32];
     if (recv_all(fd, server_pub, 32, &recv) != 0) { close(fd); return -1; }
     if (recv_all(fd, server_nonce, 32, &recv) != 0) { close(fd); return -1; }
 
-    if (!file_exists(SERVER_PUB_FILE)) {
-        if (write_file_32(SERVER_PUB_FILE, server_pub) != 0) {
-            fprintf(stderr, "failed to write %s\n", SERVER_PUB_FILE);
-            close(fd);
-            return -1;
-        }
-        printf("Client[SETUP]: Pinning server pubkey (TOFU) to %s\n", SERVER_PUB_FILE);
-    } else {
-        uint8_t pinned[32];
-        if (read_file_32(SERVER_PUB_FILE, pinned) != 0) {
-            fprintf(stderr, "failed to read %s\n", SERVER_PUB_FILE);
-            close(fd);
-            return -1;
-        }
-        if (sodium_memcmp(pinned, server_pub, 32) != 0) {
-            fprintf(stderr, "MITM ALERT: Server offered a different public key than our pinned key!\n");
-            close(fd);
-            return -1;
-        }
-        printf("Client[SETUP]: Server pubkey matches pinned value.\n");
+    if (sodium_memcmp(pinned_server_pub, server_pub, 32) != 0) {
+        fprintf(stderr, "MITM ALERT: Server offered a different public key than our pinned key!\n");
+        close(fd);
+        return -1;
     }
+    printf("Client[SETUP/ZTP]: Server pubkey matches pinned value.\n");
 
-    uint8_t A[32], s[32];
+    uint8_t A[32], s[32], bootstrap_mac[32];
     schnorr_prove_setup(A, s, x, device_id, device_pub, server_nonce);
+    compute_bootstrap_mac(bootstrap_mac, bootstrap_secret, bootstrap_id, device_id, device_pub, server_pub, client_nonce, server_nonce);
+
     if (send_all(fd, A, 32, &sent) != 0) { close(fd); return -1; }
     if (send_all(fd, s, 32, &sent) != 0) { close(fd); return -1; }
+    if (send_all(fd, bootstrap_mac, 32, &sent) != 0) { close(fd); return -1; }
     close(fd);
 
-    char hex_id[65];
-    sodium_bin2hex(hex_id, sizeof(hex_id), device_id, 32);
-
     double duration = get_time_sec() - start_time;
-    printf("Client[SETUP]: Sent=%zu bytes, Received=%zu bytes. Enrolled device_id=%s\n", sent, recv, hex_id);
+    printf("Client[SETUP/ZTP]: Sent=%zu bytes, Received=%zu bytes. Enrolled.\n", sent, recv);
     printf("CLIENT METRICS -> Duration: %.3fms\n", duration * 1000.0);
 
+    sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
     return 0;
 }
 
@@ -686,6 +754,7 @@ static void usage(const char *p) {
     fprintf(stderr, "  %s --server 127.0.0.1:4000 --setup\n", p);
     fprintf(stderr, "  %s --server 127.0.0.1:4000\n", p);
     fprintf(stderr, "  %s --pin-server-pub <hex_string>\n", p);
+    fprintf(stderr, "  %s --provision-bootstrap <bootstrap_id_hex> <bootstrap_secret_hex>\n", p);
 }
 
 int main(int argc, char **argv) {
@@ -699,6 +768,27 @@ int main(int argc, char **argv) {
             server = argv[++i];
         } else if (!strcmp(argv[i], "--setup")) {
             setup = 1;
+        } else if (!strcmp(argv[i], "--provision-bootstrap") && i + 2 < argc) {
+            const char *id_hex = argv[++i];
+            const char *sec_hex = argv[++i];
+            uint8_t bid[BOOTSTRAP_ID_LEN];
+            uint8_t bsec[BOOTSTRAP_SECRET_LEN];
+            size_t id_len = 0, sec_len = 0;
+            if (sodium_hex2bin(bid, sizeof(bid), id_hex, strlen(id_hex), NULL, &id_len, NULL) != 0 || id_len != BOOTSTRAP_ID_LEN) {
+                fprintf(stderr, "Client: invalid bootstrap_id hex\n");
+                return 1;
+            }
+            if (sodium_hex2bin(bsec, sizeof(bsec), sec_hex, strlen(sec_hex), NULL, &sec_len, NULL) != 0 || sec_len != BOOTSTRAP_SECRET_LEN) {
+                fprintf(stderr, "Client: invalid bootstrap_secret hex\n");
+                return 1;
+            }
+            if (save_bootstrap_material(bid, bsec) != 0) {
+                fprintf(stderr, "Client: failed to save bootstrap material\n");
+                return 1;
+            }
+            printf("Client: saved bootstrap_id and bootstrap_secret.\n");
+            sodium_memzero(bsec, sizeof bsec);
+            return 0;
         } else if (!strcmp(argv[i], "--pin-server-pub") && i + 1 < argc) {
             const char *hex_str = argv[++i];
             uint8_t pinned[32];
@@ -734,9 +824,9 @@ int main(int argc, char **argv) {
 
     if (setup) {
         if (created_root) {
-            printf("Client[SETUP]: No device root found; generating NEW device root (re-enroll).\n");
+            printf("Client[SETUP/ZTP]: No device root found; generating NEW device root (re-enroll).\n");
         } else {
-            printf("Client[SETUP]: Using existing device root for setup (idempotent).\n");
+            printf("Client[SETUP/ZTP]: Using existing device root for setup (idempotent).\n");
         }
     }
 

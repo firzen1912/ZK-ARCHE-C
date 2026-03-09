@@ -29,6 +29,10 @@
 #define REGISTRY_BIN    "registry.bin"
 #define REGISTRY_BAK    "registry.bak"
 #define SERVER_SK_FILE  "server_sk.bin"
+#define BOOTSTRAP_DB_FILE "bootstrap_registry.bin"
+#define BOOTSTRAP_DB_BAK  "bootstrap_registry.bak"
+#define BOOTSTRAP_ID_LEN 32
+#define BOOTSTRAP_SECRET_LEN 32
 
 // Replay cache params
 #define REPLAY_MAX 50000
@@ -36,6 +40,9 @@
 // Pairing policy
 typedef struct {
     int enabled;
+    int token_configured;
+    char token[128];
+    double deadline_sec; /* 0 => no deadline */
 } pairing_policy_t;
 
 // -----------------------------
@@ -164,6 +171,68 @@ static int reg_upsert(reg_entry_t **arrp, size_t *np, const uint8_t id[32], cons
     *np = n;
 
     return (save_registry(arr, n) == 0) ? 1 : -1;
+}
+
+// -----------------------------
+// Bootstrap DB persistence
+// -----------------------------
+typedef struct {
+    uint8_t id[BOOTSTRAP_ID_LEN];
+    uint8_t secret[BOOTSTRAP_SECRET_LEN];
+} bootstrap_entry_t;
+
+static int load_bootstrap_db(bootstrap_entry_t **out, size_t *out_n) {
+    *out = NULL; *out_n = 0;
+    if (!file_exists(BOOTSTRAP_DB_FILE)) return 0;
+    FILE *f = fopen(BOOTSTRAP_DB_FILE, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
+    if ((sz % 64) != 0) { fclose(f); return -1; }
+    size_t n = (size_t)sz / 64;
+    if (n == 0) { fclose(f); return 0; }
+    bootstrap_entry_t *arr = (bootstrap_entry_t*)calloc(n, sizeof(*arr));
+    if (!arr) { fclose(f); return -1; }
+    for (size_t i = 0; i < n; i++) {
+        if (fread(arr[i].id, 1, 32, f) != 32) { fclose(f); free(arr); return -1; }
+        if (fread(arr[i].secret, 1, 32, f) != 32) { fclose(f); free(arr); return -1; }
+    }
+    fclose(f);
+    *out = arr; *out_n = n; return 0;
+}
+
+static int save_bootstrap_db(const bootstrap_entry_t *arr, size_t n) {
+    if (file_exists(BOOTSTRAP_DB_FILE)) rename(BOOTSTRAP_DB_FILE, BOOTSTRAP_DB_BAK);
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", BOOTSTRAP_DB_FILE);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (fwrite(arr[i].id, 1, 32, f) != 32) { fclose(f); return -1; }
+        if (fwrite(arr[i].secret, 1, 32, f) != 32) { fclose(f); return -1; }
+    }
+    fflush(f); fsync(fileno(f)); fclose(f);
+    return rename(tmp, BOOTSTRAP_DB_FILE);
+}
+
+static int bootstrap_lookup(const bootstrap_entry_t *arr, size_t n, const uint8_t id[32], uint8_t secret_out[32]) {
+    for (size_t i = 0; i < n; i++) {
+        if (sodium_memcmp(arr[i].id, id, 32) == 0) { memcpy(secret_out, arr[i].secret, 32); return 0; }
+    }
+    return -1;
+}
+
+static int bootstrap_upsert(bootstrap_entry_t **arrp, size_t *np, const uint8_t id[32], const uint8_t secret[32]) {
+    bootstrap_entry_t *arr = *arrp; size_t n = *np;
+    for (size_t i = 0; i < n; i++) {
+        if (sodium_memcmp(arr[i].id, id, 32) == 0) { memcpy(arr[i].secret, secret, 32); *arrp = arr; *np = n; return save_bootstrap_db(arr, n); }
+    }
+    bootstrap_entry_t *b = (bootstrap_entry_t*)realloc(arr, (n + 1) * sizeof(*b));
+    if (!b) return -1;
+    arr = b; memcpy(arr[n].id, id, 32); memcpy(arr[n].secret, secret, 32); n++;
+    *arrp = arr; *np = n; return save_bootstrap_db(arr, n);
 }
 
 // -----------------------------
@@ -470,6 +539,42 @@ static void hmac_tag(uint8_t out[32], const uint8_t key[32], const char *label, 
     crypto_auth_hmacsha256_final(&st, out);
 }
 
+static void ztp_mac_transcript_hash(uint8_t out[32],
+                                    const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
+                                    const uint8_t device_id[32],
+                                    const uint8_t device_pub[32],
+                                    const uint8_t server_pub[32],
+                                    const uint8_t client_nonce[32],
+                                    const uint8_t server_nonce[32]) {
+    transcript_t tr;
+    tr_init(&tr, "ztp-bootstrap-v1");
+    tr_append(&tr, "bootstrap_id", bootstrap_id, BOOTSTRAP_ID_LEN);
+    tr_append(&tr, "device_id", device_id, 32);
+    tr_append(&tr, "device_pub", device_pub, 32);
+    tr_append(&tr, "server_pub", server_pub, 32);
+    tr_append(&tr, "client_nonce", client_nonce, 32);
+    tr_append(&tr, "server_nonce", server_nonce, 32);
+    crypto_hash_sha256(out, tr.buf, (unsigned long long)tr.len);
+}
+
+static void compute_bootstrap_mac(uint8_t out[32],
+                                  const uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN],
+                                  const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
+                                  const uint8_t device_id[32],
+                                  const uint8_t device_pub[32],
+                                  const uint8_t server_pub[32],
+                                  const uint8_t client_nonce[32],
+                                  const uint8_t server_nonce[32]) {
+    uint8_t th[32];
+    crypto_auth_hmacsha256_state st;
+    ztp_mac_transcript_hash(th, bootstrap_id, device_id, device_pub, server_pub, client_nonce, server_nonce);
+    crypto_auth_hmacsha256_init(&st, bootstrap_secret, BOOTSTRAP_SECRET_LEN);
+    crypto_auth_hmacsha256_update(&st, (const unsigned char*)"ztp-bootstrap-mac", 17);
+    crypto_auth_hmacsha256_update(&st, th, 32);
+    crypto_auth_hmacsha256_final(&st, out);
+    sodium_memzero(th, sizeof th);
+}
+
 // -----------------------------
 // TCP listen
 // -----------------------------
@@ -510,6 +615,7 @@ static int parse_bind(const char *bind, char ip[64], uint16_t *port) {
 // -----------------------------
 static void handle_client(int cfd, const char *peer,
                           reg_entry_t **reg, size_t *reg_n,
+                          bootstrap_entry_t **boot, size_t *boot_n,
                           const uint8_t server_sk[32],
                           const uint8_t server_pub[32],
                           const pairing_policy_t *policy) {
@@ -522,24 +628,42 @@ static void handle_client(int cfd, const char *peer,
     }
 
     if (msg_type == MSG_SETUP) {
-        uint8_t tlen;
-        if (recv_u8(cfd, &tlen, &recv) != 0) goto cleanup;
-
-        if (tlen > 0) {
-            uint8_t *tmp = (uint8_t*)malloc(tlen);
-            if (!tmp) goto cleanup;
-            if (recv_all(cfd, tmp, tlen, &recv) != 0) { free(tmp); goto cleanup; }
-            free(tmp);
-        }
-
         if (!policy || !policy->enabled) {
-            fprintf(stderr, "Server[SETUP]: pairing not allowed\n");
+            fprintf(stderr, "Server[SETUP/ZTP]: pairing not allowed\n");
+            goto cleanup;
+        }
+        if (policy->deadline_sec > 0.0 && get_time_sec() > policy->deadline_sec) {
+            fprintf(stderr, "Server[SETUP/ZTP]: pairing window expired\n");
             goto cleanup;
         }
 
-        uint8_t device_id[32], device_pub[32];
+        uint8_t bid_len;
+        if (recv_u8(cfd, &bid_len, &recv) != 0) goto cleanup;
+        if (bid_len != BOOTSTRAP_ID_LEN) {
+            fprintf(stderr, "Server[SETUP/ZTP]: invalid bootstrap_id length\n");
+            goto cleanup;
+        }
+
+        uint8_t bootstrap_id[BOOTSTRAP_ID_LEN];
+        uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN];
+        uint8_t device_id[32], device_pub[32], client_nonce[32];
+        if (recv_all(cfd, bootstrap_id, BOOTSTRAP_ID_LEN, &recv) != 0) goto cleanup;
         if (recv_all(cfd, device_id, 32, &recv) != 0) goto cleanup;
         if (recv_all(cfd, device_pub, 32, &recv) != 0) goto cleanup;
+        if (recv_all(cfd, client_nonce, 32, &recv) != 0) goto cleanup;
+
+        if (bootstrap_lookup(*boot, *boot_n, bootstrap_id, bootstrap_secret) != 0) {
+            fprintf(stderr, "Server[SETUP/ZTP]: unknown bootstrap_id\n");
+            goto cleanup;
+        }
+
+        uint8_t existing_pub[32];
+        int existing = reg_lookup(*reg, *reg_n, device_id, existing_pub);
+        int is_new = (existing != 0);
+        if (!is_new && sodium_memcmp(existing_pub, device_pub, 32) != 0) {
+            fprintf(stderr, "Server[SETUP/ZTP]: device_id mismatch\n");
+            goto cleanup;
+        }
 
         uint8_t server_nonce[32];
         randombytes_buf(server_nonce, 32);
@@ -547,27 +671,38 @@ static void handle_client(int cfd, const char *peer,
         if (send_all(cfd, server_pub, 32, &sent) != 0) goto cleanup;
         if (send_all(cfd, server_nonce, 32, &sent) != 0) goto cleanup;
 
-        uint8_t A[32], s[32];
+        uint8_t A[32], s[32], bootstrap_mac[32], expected_bootstrap_mac[32];
         if (recv_all(cfd, A, 32, &recv) != 0) goto cleanup;
         if (recv_all(cfd, s, 32, &recv) != 0) goto cleanup;
+        if (recv_all(cfd, bootstrap_mac, 32, &recv) != 0) goto cleanup;
 
         if (schnorr_verify_setup(device_id, device_pub, server_nonce, A, s) != 0) {
-            fprintf(stderr, "Server[SETUP]: PoP invalid\n");
+            fprintf(stderr, "Server[SETUP/ZTP]: setup PoP invalid\n");
             goto cleanup;
         }
 
-        char hex_id[65];
+        compute_bootstrap_mac(expected_bootstrap_mac, bootstrap_secret, bootstrap_id, device_id, device_pub, server_pub, client_nonce, server_nonce);
+        if (sodium_memcmp(expected_bootstrap_mac, bootstrap_mac, 32) != 0) {
+            fprintf(stderr, "Server[SETUP/ZTP]: bootstrap MAC invalid\n");
+            goto cleanup;
+        }
+
+        char hex_id[65], hex_bid[65];
         sodium_bin2hex(hex_id, sizeof(hex_id), device_id, 32);
+        sodium_bin2hex(hex_bid, sizeof(hex_bid), bootstrap_id, BOOTSTRAP_ID_LEN);
 
         int upsert_res = reg_upsert(reg, reg_n, device_id, device_pub);
         if (upsert_res < 0) {
-            fprintf(stderr, "Server[SETUP]: registry update failed (mismatch)\n");
+            fprintf(stderr, "Server[SETUP/ZTP]: registry update failed (mismatch)\n");
             goto cleanup;
         } else if (upsert_res == 1) {
-            printf("Server[SETUP]: enrolled NEW device_id=%s\n", hex_id);
+            printf("Server[SETUP/ZTP]: enrolled NEW device_id=%s bootstrap_id=%s\n", hex_id, hex_bid);
         } else {
-            printf("Server[SETUP]: validated existing device_id=%s\n", hex_id);
+            printf("Server[SETUP/ZTP]: validated existing device_id=%s bootstrap_id=%s\n", hex_id, hex_bid);
         }
+
+        sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
+        sodium_memzero(expected_bootstrap_mac, sizeof expected_bootstrap_mac);
     } 
     else if (msg_type == MSG_AUTH_V2) {
         // 1. ANONYMOUS EPHEMERAL KEY EXCHANGE (ECDHE)
@@ -752,17 +887,70 @@ int main(int argc, char **argv) {
     if (sodium_init() < 0) return 1;
 
     const char *bind_str = "0.0.0.0:4000";
-    pairing_policy_t policy = {0};
+    pairing_policy_t policy;
+    memset(&policy, 0, sizeof policy);
+
+    uint8_t add_bootstrap_id[BOOTSTRAP_ID_LEN];
+    uint8_t add_bootstrap_secret[BOOTSTRAP_SECRET_LEN];
+    int have_add_bootstrap = 0;
+
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_str = argv[++i];
-        else if (!strcmp(argv[i], "--pairing")) policy.enabled = 1;
-        else { fprintf(stderr, "Usage: %s --bind 0.0.0.0:4000 [--pairing]\n", argv[0]); return 1; }
+        if (!strcmp(argv[i], "--bind") && i + 1 < argc) {
+            bind_str = argv[++i];
+        } else if (!strcmp(argv[i], "--pairing")) {
+            policy.enabled = 1;
+        } else if (!strcmp(argv[i], "--pairing-token") && i + 1 < argc) {
+            policy.token_configured = 1;
+            snprintf(policy.token, sizeof(policy.token), "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--pairing-seconds") && i + 1 < argc) {
+            double secs = atof(argv[++i]);
+            if (secs <= 0) {
+                fprintf(stderr, "bad --pairing-seconds value\n");
+                return 1;
+            }
+            policy.deadline_sec = get_time_sec() + secs;
+        } else if (!strcmp(argv[i], "--add-bootstrap") && i + 2 < argc) {
+            size_t bin_len = 0;
+            if (sodium_hex2bin(add_bootstrap_id, sizeof add_bootstrap_id, argv[i + 1], strlen(argv[i + 1]), NULL, &bin_len, NULL) != 0 || bin_len != BOOTSTRAP_ID_LEN) {
+                fprintf(stderr, "invalid bootstrap_id hex\n");
+                return 1;
+            }
+            if (sodium_hex2bin(add_bootstrap_secret, sizeof add_bootstrap_secret, argv[i + 2], strlen(argv[i + 2]), NULL, &bin_len, NULL) != 0 || bin_len != BOOTSTRAP_SECRET_LEN) {
+                fprintf(stderr, "invalid bootstrap_secret hex\n");
+                return 1;
+            }
+            have_add_bootstrap = 1;
+            i += 2;
+        } else {
+            fprintf(stderr, "Usage: %s [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--add-bootstrap <bootstrap_id_hex> <bootstrap_secret_hex>]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    bootstrap_entry_t *boot = NULL;
+    size_t boot_n = 0;
+    if (load_bootstrap_db(&boot, &boot_n) != 0) {
+        fprintf(stderr, "Failed to load bootstrap DB\n");
+        return 1;
+    }
+    if (have_add_bootstrap) {
+        if (bootstrap_upsert(&boot, &boot_n, add_bootstrap_id, add_bootstrap_secret) != 0) {
+            fprintf(stderr, "Failed to update bootstrap DB\n");
+            return 1;
+        }
+        char hex_bid[65];
+        sodium_bin2hex(hex_bid, sizeof hex_bid, add_bootstrap_id, BOOTSTRAP_ID_LEN);
+        printf("Server: added bootstrap_id=%s to %s\n", hex_bid, BOOTSTRAP_DB_FILE);
+        sodium_memzero(add_bootstrap_secret, sizeof add_bootstrap_secret);
+        free(boot);
+        return 0;
     }
 
     char ip[64];
     uint16_t port;
     if (parse_bind(bind_str, ip, &port) != 0) {
         fprintf(stderr, "bad --bind value\n");
+        free(boot);
         return 1;
     }
 
@@ -770,12 +958,14 @@ int main(int argc, char **argv) {
     if (file_exists(SERVER_SK_FILE)) {
         if (read_file_32(SERVER_SK_FILE, server_sk) != 0) {
             fprintf(stderr, "failed reading %s\n", SERVER_SK_FILE);
+            free(boot);
             return 1;
         }
     } else {
         crypto_core_ristretto255_scalar_random(server_sk);
         if (write_file_32(SERVER_SK_FILE, server_sk) != 0) {
             fprintf(stderr, "failed writing %s\n", SERVER_SK_FILE);
+            free(boot);
             return 1;
         }
     }
@@ -787,12 +977,24 @@ int main(int argc, char **argv) {
     size_t reg_n = 0;
     if (load_registry(&reg, &reg_n) != 0) {
         fprintf(stderr, "Failed to load registry\n");
+        free(boot);
         return 1;
     }
 
     int lfd = listen_tcp(ip, port);
-    if (lfd < 0) { fprintf(stderr, "listen failed\n"); return 1; }
+    if (lfd < 0) {
+        fprintf(stderr, "listen failed\n");
+        free(reg);
+        free(boot);
+        return 1;
+    }
+
     printf("C Server listening on %s\n", bind_str);
+    printf("Server: pairing_enabled=%s token_configured=%s deadline_sec=%s bootstrap_db_entries=%zu\n",
+           policy.enabled ? "true" : "false",
+           policy.token_configured ? "true" : "false",
+           policy.deadline_sec > 0.0 ? "set" : "none",
+           boot_n);
 
     for (;;) {
         struct sockaddr_in peer_addr;
@@ -802,10 +1004,10 @@ int main(int argc, char **argv) {
 
         char peer_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip));
-        
+
         char peer_str[64];
         snprintf(peer_str, sizeof(peer_str), "%s:%d", peer_ip, ntohs(peer_addr.sin_port));
 
-        handle_client(cfd, peer_str, &reg, &reg_n, server_sk, server_pub, &policy);
+        handle_client(cfd, peer_str, &reg, &reg_n, &boot, &boot_n, server_sk, server_pub, &policy);
     }
 }
