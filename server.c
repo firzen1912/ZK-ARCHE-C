@@ -1,13 +1,14 @@
 // ==============================
-// c_server.c  (V2: Zero Privacy + TOFU Pinning & Key Confirmation)
+// server.c (ZK-ARCHE C Implementation)
 // ==============================
 //
-// Goals:
-//   1) Let clients learn/pin server identity during SETUP by sending server_static_pub.
-//   2) Mutual auth: server proves possession of its static secret during AUTH.
-//   3) Zero Privacy: Hide identity via ECDHE (X25519) + ChaCha20Poly1305 tunnel during AUTH.
-//   4) Replay protection: persistent nonce tracking (dropped time-based TTL for DoS fix).
-//   5) Key confirmation MACs: server sends tag_s, client replies tag_c over the secure tunnel.
+// [TOFU-FIX] After both Schnorr proof and bootstrap MAC verify, handle_client
+//   (MSG_SETUP branch) now sends a 1-byte enrollment acknowledgment (0x01) back
+//   to the client.  The client waits for this ack before pinning the server's
+//   public key — guaranteeing the key is only ever pinned after the server has
+//   confirmed the full exchange was authentic.  A MITM cannot produce a valid ack
+//   because the bootstrap MAC transcript includes server_pub, so substituting a
+//   different key breaks the MAC check and execution never reaches the send.
 //
 // Build:
 //   gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium
@@ -23,7 +24,6 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-// ─── Protocol constants ───────────────────────────────────────────────────────
 #define MSG_SETUP    0x01
 #define MSG_AUTH_V2  0x03
 
@@ -34,15 +34,9 @@
 #define BOOTSTRAP_DB_BAK  "bootstrap_registry.bak"
 #define BOOTSTRAP_ID_LEN      32
 #define BOOTSTRAP_SECRET_LEN  32
-
-// [FIX-4] Hard cap on incoming encrypted payload
 #define MAX_ENCRYPTED_PAYLOAD  4096
-
-// [FIX-5] Each replay cache generation holds at most this many entries.
-// When current fills up, it becomes previous and a fresh current starts.
 #define REPLAY_GEN_MAX  25000
 
-// ─── [FIX-9] Nonce counter ────────────────────────────────────────────────────
 typedef struct { uint64_t count; } nonce_ctr_t;
 #define NONCE_CTR_INIT { 0 }
 
@@ -59,19 +53,15 @@ static void nonce_next(nonce_ctr_t *c, uint8_t out[12]) {
     out[8]  = 0; out[9] = 0; out[10] = 0; out[11] = 0;
 }
 
-// ─── [FIX-1] Pairing policy ───────────────────────────────────────────────────
 typedef struct {
     int    enabled;
     int    token_configured;
     char   token[128];
-    double deadline_sec; // 0 = no deadline
+    double deadline_sec;
 } pairing_policy_t;
 
-// Returns 0 if the setup is allowed, -1 if not.
-// [FIX-1] provided_token (may be NULL) is compared constant-time against the
-//          configured token when one is required.
 static int allows_ztp_setup(const pairing_policy_t *pol,
-                              const char *provided_token, size_t provided_len) {
+                            const char *provided_token, size_t provided_len) {
     if (!pol->enabled) return -1;
 
     if (pol->deadline_sec > 0.0) {
@@ -84,18 +74,15 @@ static int allows_ztp_setup(const pairing_policy_t *pol,
         }
     }
 
-    // [FIX-1] Token enforcement
     if (pol->token_configured) {
         size_t expected_len = strlen(pol->token);
         if (!provided_token || provided_len != expected_len) return -1;
-        // sodium_memcmp is constant-time
         if (sodium_memcmp(provided_token, pol->token, expected_len) != 0) return -1;
     }
 
     return 0;
 }
 
-// ─── File helpers ─────────────────────────────────────────────────────────────
 static int file_exists(const char *path) { return access(path, F_OK) == 0; }
 
 static int read_file_32(const char *path, uint8_t out[32]) {
@@ -114,14 +101,12 @@ static int write_file_32(const char *path, const uint8_t in[32]) {
     return (n == 32) ? 0 : -1;
 }
 
-// ─── Timing helper ───────────────────────────────────────────────────────────
 static double get_time_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-// ─── Registry persistence ─────────────────────────────────────────────────────
 typedef struct { uint8_t id[32]; uint8_t pub[32]; } reg_entry_t;
 
 static int load_registry(reg_entry_t **out, size_t *out_n) {
@@ -165,7 +150,7 @@ static int save_registry(const reg_entry_t *arr, size_t n) {
 }
 
 static int reg_lookup(const reg_entry_t *arr, size_t n,
-                       const uint8_t id[32], uint8_t pub_out[32]) {
+                      const uint8_t id[32], uint8_t pub_out[32]) {
     for (size_t i = 0; i < n; i++) {
         if (sodium_memcmp(arr[i].id, id, 32) == 0) {
             memcpy(pub_out, arr[i].pub, 32);
@@ -175,9 +160,8 @@ static int reg_lookup(const reg_entry_t *arr, size_t n,
     return -1;
 }
 
-// Returns: 1=new entry saved, 0=existing matched (no change), -1=error/mismatch
 static int reg_upsert(reg_entry_t **arrp, size_t *np,
-                       const uint8_t id[32], const uint8_t pub[32]) {
+                      const uint8_t id[32], const uint8_t pub[32]) {
     reg_entry_t *arr = *arrp;
     size_t n = *np;
     for (size_t i = 0; i < n; i++) {
@@ -196,7 +180,6 @@ static int reg_upsert(reg_entry_t **arrp, size_t *np,
     return (save_registry(arr, n) == 0) ? 1 : -1;
 }
 
-// ─── Bootstrap DB ─────────────────────────────────────────────────────────────
 typedef struct {
     uint8_t id[BOOTSTRAP_ID_LEN];
     uint8_t secret[BOOTSTRAP_SECRET_LEN];
@@ -243,7 +226,7 @@ static int save_bootstrap_db(const bootstrap_entry_t *arr, size_t n) {
 }
 
 static int bootstrap_lookup(const bootstrap_entry_t *arr, size_t n,
-                              const uint8_t id[32], uint8_t secret_out[32]) {
+                            const uint8_t id[32], uint8_t secret_out[32]) {
     for (size_t i = 0; i < n; i++) {
         if (sodium_memcmp(arr[i].id, id, 32) == 0) {
             memcpy(secret_out, arr[i].secret, 32);
@@ -254,7 +237,7 @@ static int bootstrap_lookup(const bootstrap_entry_t *arr, size_t n,
 }
 
 static int bootstrap_upsert(bootstrap_entry_t **arrp, size_t *np,
-                              const uint8_t id[32], const uint8_t secret[32]) {
+                            const uint8_t id[32], const uint8_t secret[32]) {
     bootstrap_entry_t *arr = *arrp;
     size_t n = *np;
     for (size_t i = 0; i < n; i++) {
@@ -273,13 +256,6 @@ static int bootstrap_upsert(bootstrap_entry_t **arrp, size_t *np,
     return save_bootstrap_db(arr, n);
 }
 
-// ─── [FIX-5] Two-generation replay cache ─────────────────────────────────────
-//
-// Nonces are never forgotten within a window of 2*REPLAY_GEN_MAX entries.
-// When the current generation fills, it becomes previous and a fresh current
-// starts — using the swapped buffer to avoid realloc on the hot path.
-//
-// Because the C server is single-threaded no mutex is required.
 typedef struct { uint8_t key[64]; } replay_key_t;
 
 static replay_key_t *replay_curr  = NULL;
@@ -300,14 +276,13 @@ static int replay_init(void) {
 }
 
 static int check_and_insert_replay(const uint8_t device_id[32],
-                                     const uint8_t nonce_c[32]) {
-    if (!replay_curr) return -1; // not initialised
+                                   const uint8_t nonce_c[32]) {
+    if (!replay_curr) return -1;
 
     uint8_t k[64];
     memcpy(k,      device_id, 32);
     memcpy(k + 32, nonce_c,   32);
 
-    // Check both generations (constant-time sodium_memcmp)
     for (size_t i = 0; i < replay_curr_n; i++) {
         if (sodium_memcmp(replay_curr[i].key, k, 64) == 0) return -1;
     }
@@ -315,12 +290,11 @@ static int check_and_insert_replay(const uint8_t device_id[32],
         if (sodium_memcmp(replay_prev[i].key, k, 64) == 0) return -1;
     }
 
-    // Rotate when current is full: swap buffers, reset current counter
     if (replay_curr_n >= REPLAY_GEN_MAX) {
         replay_key_t *tmp = replay_prev;
         replay_prev   = replay_curr;
         replay_prev_n = replay_curr_n;
-        replay_curr   = tmp;          // reuse previous buffer
+        replay_curr   = tmp;
         replay_curr_n = 0;
     }
 
@@ -328,9 +302,7 @@ static int check_and_insert_replay(const uint8_t device_id[32],
     return 0;
 }
 
-// ─── Network helpers ──────────────────────────────────────────────────────────
-static int send_all(int fd, const uint8_t *buf, size_t len,
-                     size_t *sent_tracker) {
+static int send_all(int fd, const uint8_t *buf, size_t len, size_t *sent_tracker) {
     size_t off = 0;
     while (off < len) {
         ssize_t n = send(fd, buf + off, len - off, 0);
@@ -341,8 +313,7 @@ static int send_all(int fd, const uint8_t *buf, size_t len,
     return 0;
 }
 
-static int recv_all(int fd, uint8_t *buf, size_t len,
-                     size_t *recv_tracker) {
+static int recv_all(int fd, uint8_t *buf, size_t len, size_t *recv_tracker) {
     size_t off = 0;
     while (off < len) {
         ssize_t n = recv(fd, buf + off, len - off, 0);
@@ -357,7 +328,6 @@ static int recv_u8(int fd, uint8_t *out, size_t *recv_tracker) {
     return recv_all(fd, out, 1, recv_tracker);
 }
 
-// [FIX-C2] Returns int
 static int send_u32_le(int fd, uint32_t val, size_t *sent_tracker) {
     uint8_t buf[4];
     buf[0] = (uint8_t)(val & 0xFF);
@@ -375,14 +345,11 @@ static int recv_u32_le(int fd, uint32_t *val, size_t *recv_tracker) {
     return 0;
 }
 
-// [FIX-4] Bounded ciphertext read
-static uint8_t *recv_encrypted_blob(int fd, uint32_t *out_len,
-                                     size_t *recv_tracker) {
+static uint8_t *recv_encrypted_blob(int fd, uint32_t *out_len, size_t *recv_tracker) {
     uint32_t rx_len;
     if (recv_u32_le(fd, &rx_len, recv_tracker) != 0) return NULL;
     if (rx_len > MAX_ENCRYPTED_PAYLOAD) {
-        fprintf(stderr, "payload too large: %u (max %d)\n",
-                rx_len, MAX_ENCRYPTED_PAYLOAD);
+        fprintf(stderr, "payload too large: %u (max %d)\n", rx_len, MAX_ENCRYPTED_PAYLOAD);
         return NULL;
     }
     uint8_t *buf = malloc(rx_len);
@@ -392,25 +359,20 @@ static uint8_t *recv_encrypted_blob(int fd, uint32_t *out_len,
     return buf;
 }
 
-// [FIX-11] Receive the pairing token sent by the client during SETUP.
-// Wire format: 1-byte length (0 = no token) followed by that many bytes.
-// Writes token into caller-supplied buffer (max 128 bytes) and sets *out_len.
-static int recv_pairing_token(int fd, char token_buf[128], size_t *out_len,
-                                size_t *recv_tracker) {
+static int recv_pairing_token(int fd, char token_buf[128], size_t *out_len, size_t *recv_tracker) {
     uint8_t tlen;
     if (recv_u8(fd, &tlen, recv_tracker) != 0) return -1;
     *out_len = tlen;
-    if (tlen == 0) return 0; // no token
+    if (tlen == 0) return 0;
     if (tlen > 128) {
         fprintf(stderr, "pairing token too long\n");
         return -1;
     }
     if (recv_all(fd, (uint8_t *)token_buf, tlen, recv_tracker) != 0) return -1;
-    token_buf[tlen] = '\0'; // safe: buffer is [128], max tlen=127
+    token_buf[tlen] = '\0';
     return 0;
 }
 
-// ─── [FIX-7] Point validity helper ───────────────────────────────────────────
 static int check_point(const uint8_t p[32], const char *what) {
     if (crypto_core_ristretto255_is_valid_point(p) != 1) {
         fprintf(stderr, "invalid or identity point: %s\n", what);
@@ -419,7 +381,6 @@ static int check_point(const uint8_t p[32], const char *what) {
     return 0;
 }
 
-// ─── Transcript ──────────────────────────────────────────────────────────────
 typedef struct { uint8_t buf[4096]; size_t len; } transcript_t;
 
 static void tr_init(transcript_t *tr, const char *domain) {
@@ -431,8 +392,7 @@ static void tr_init(transcript_t *tr, const char *domain) {
     tr->len += dlen;
 }
 
-static void tr_append(transcript_t *tr, const char *label,
-                       const uint8_t *val, uint32_t vlen) {
+static void tr_append(transcript_t *tr, const char *label, const uint8_t *val, uint32_t vlen) {
     size_t llen = strlen(label);
     if (llen > 255) { fprintf(stderr, "label too long\n"); exit(1); }
     if (tr->len + 1 + llen + 4 + (size_t)vlen > sizeof(tr->buf)) {
@@ -455,19 +415,15 @@ static void tr_challenge_scalar(uint8_t c_out[32], const transcript_t *tr) {
     crypto_core_ristretto255_scalar_reduce(c_out, h);
 }
 
-// ─── Schnorr verify/prove ─────────────────────────────────────────────────────
-static int schnorr_verify_setup(const uint8_t device_id[32],
-                                  const uint8_t pubkey[32],
-                                  const uint8_t server_nonce[32],
-                                  const uint8_t A[32],
-                                  const uint8_t s[32]) {
+static int schnorr_verify_setup(const uint8_t device_id[32], const uint8_t pubkey[32],
+                                const uint8_t server_nonce[32], const uint8_t A[32], const uint8_t s[32]) {
     uint8_t c[32], left[32], cX[32], right[32];
     transcript_t tr;
     tr_init(&tr, "setup_schnorr_v1");
     tr_append(&tr, "device_id",    device_id,    32);
-    tr_append(&tr, "pubkey",       pubkey,        32);
-    tr_append(&tr, "a",            A,             32);
-    tr_append(&tr, "server_nonce", server_nonce,  32);
+    tr_append(&tr, "pubkey",       pubkey,       32);
+    tr_append(&tr, "a",            A,            32);
+    tr_append(&tr, "server_nonce", server_nonce, 32);
     tr_challenge_scalar(c, &tr);
     crypto_scalarmult_ristretto255_base(left, s);
     if (crypto_scalarmult_ristretto255(cX, c, pubkey) != 0) return -1;
@@ -475,20 +431,17 @@ static int schnorr_verify_setup(const uint8_t device_id[32],
     return (sodium_memcmp(left, right, 32) == 0) ? 0 : -1;
 }
 
-static int schnorr_verify_auth(const uint8_t device_id[32],
-                                 const uint8_t expected_pub[32],
-                                 const uint8_t A[32],
-                                 const uint8_t s[32],
-                                 const uint8_t nonce_c[32],
-                                 const uint8_t eph_c[32]) {
+static int schnorr_verify_auth(const uint8_t device_id[32], const uint8_t expected_pub[32],
+                               const uint8_t A[32], const uint8_t s[32],
+                               const uint8_t nonce_c[32], const uint8_t eph_c[32]) {
     uint8_t c[32], left[32], cX[32], right[32];
     transcript_t tr;
     tr_init(&tr, "client_schnorr_v1");
     tr_append(&tr, "device_id", device_id,    32);
-    tr_append(&tr, "pubkey",    expected_pub,  32);
-    tr_append(&tr, "a",         A,             32);
-    tr_append(&tr, "nonce_c",   nonce_c,       32);
-    tr_append(&tr, "eph_c",     eph_c,         32);
+    tr_append(&tr, "pubkey",    expected_pub, 32);
+    tr_append(&tr, "a",         A,            32);
+    tr_append(&tr, "nonce_c",   nonce_c,      32);
+    tr_append(&tr, "eph_c",     eph_c,        32);
     tr_challenge_scalar(c, &tr);
     crypto_scalarmult_ristretto255_base(left, s);
     if (crypto_scalarmult_ristretto255(cX, c, expected_pub) != 0) return -1;
@@ -496,20 +449,17 @@ static int schnorr_verify_auth(const uint8_t device_id[32],
     return (sodium_memcmp(left, right, 32) == 0) ? 0 : -1;
 }
 
-static void schnorr_prove_server(uint8_t A[32], uint8_t s[32],
-                                  const uint8_t server_sk[32],
-                                  const uint8_t server_pub[32],
-                                  const uint8_t nonce_s[32],
-                                  const uint8_t eph_s[32]) {
+static void schnorr_prove_server(uint8_t A[32], uint8_t s[32], const uint8_t server_sk[32],
+                                 const uint8_t server_pub[32], const uint8_t nonce_s[32], const uint8_t eph_s[32]) {
     uint8_t r[32], c[32], cx[32];
     crypto_core_ristretto255_scalar_random(r);
     crypto_scalarmult_ristretto255_base(A, r);
     transcript_t tr;
     tr_init(&tr, "server_schnorr_v1");
-    tr_append(&tr, "pubkey", server_pub, 32);
-    tr_append(&tr, "a",      A,          32);
-    tr_append(&tr, "nonce_s", nonce_s,   32);
-    tr_append(&tr, "eph_s",  eph_s,      32);
+    tr_append(&tr, "pubkey",  server_pub, 32);
+    tr_append(&tr, "a",       A,          32);
+    tr_append(&tr, "nonce_s", nonce_s,    32);
+    tr_append(&tr, "eph_s",   eph_s,      32);
     tr_challenge_scalar(c, &tr);
     crypto_core_ristretto255_scalar_mul(cx, c, server_sk);
     crypto_core_ristretto255_scalar_add(s, r, cx);
@@ -518,9 +468,8 @@ static void schnorr_prove_server(uint8_t A[32], uint8_t s[32],
     sodium_memzero(c, sizeof c);
 }
 
-// ─── HKDF-SHA256 ─────────────────────────────────────────────────────────────
 static void hkdf_extract(uint8_t prk[32], const uint8_t *salt, size_t salt_len,
-                          const uint8_t *ikm, size_t ikm_len) {
+                         const uint8_t *ikm, size_t ikm_len) {
     crypto_auth_hmacsha256_state st;
     crypto_auth_hmacsha256_init(&st, salt, salt_len);
     crypto_auth_hmacsha256_update(&st, ikm, ikm_len);
@@ -528,7 +477,7 @@ static void hkdf_extract(uint8_t prk[32], const uint8_t *salt, size_t salt_len,
 }
 
 static void hkdf_expand(uint8_t *okm, size_t okm_len, const uint8_t prk[32],
-                         const uint8_t *info, size_t info_len) {
+                        const uint8_t *info, size_t info_len) {
     uint8_t t[32];
     size_t  t_len = 0, out = 0;
     uint8_t ctr = 1;
@@ -547,21 +496,13 @@ static void hkdf_expand(uint8_t *okm, size_t okm_len, const uint8_t prk[32],
     sodium_memzero(t, sizeof t);
 }
 
-// [FIX-8]  x25519_shared mixed into info (channel binding).
-// [FIX-C1] eph_c_pub and eph_s_pub are explicit canonical-order parameters
-//           (client eph first, server eph second) so both sides agree on info.
-static int derive_session_key(uint8_t key[32],
-                               const uint8_t ristretto_eph_scalar[32],
-                               const uint8_t ristretto_peer_pub[32],
-                               const uint8_t nonce_c[32],
-                               const uint8_t nonce_s[32],
-                               const uint8_t device_id[32],
-                               const uint8_t eph_c_pub[32],    // [FIX-C1]
-                               const uint8_t eph_s_pub[32],    // [FIX-C1]
-                               const uint8_t x25519_shared[32]) { // [FIX-8]
+static int derive_session_key(uint8_t key[32], const uint8_t ristretto_eph_scalar[32],
+                              const uint8_t ristretto_peer_pub[32], const uint8_t nonce_c[32],
+                              const uint8_t nonce_s[32], const uint8_t device_id[32],
+                              const uint8_t eph_c_pub[32], const uint8_t eph_s_pub[32],
+                              const uint8_t x25519_shared[32]) {
     uint8_t shared[32];
-    if (crypto_scalarmult_ristretto255(shared, ristretto_eph_scalar,
-                                        ristretto_peer_pub) != 0) {
+    if (crypto_scalarmult_ristretto255(shared, ristretto_eph_scalar, ristretto_peer_pub) != 0) {
         sodium_memzero(shared, sizeof shared);
         return -1;
     }
@@ -574,9 +515,9 @@ static int derive_session_key(uint8_t key[32],
     size_t off = 0;
     memcpy(info + off, "session key",  11); off += 11;
     memcpy(info + off, device_id,      32); off += 32;
-    memcpy(info + off, eph_c_pub,      32); off += 32;  // [FIX-C1]
-    memcpy(info + off, eph_s_pub,      32); off += 32;  // [FIX-C1]
-    memcpy(info + off, x25519_shared,  32); off += 32;  // [FIX-8]
+    memcpy(info + off, eph_c_pub,      32); off += 32;
+    memcpy(info + off, eph_s_pub,      32); off += 32;
+    memcpy(info + off, x25519_shared,  32); off += 32;
 
     uint8_t prk[32];
     hkdf_extract(prk, salt, sizeof salt, shared, sizeof shared);
@@ -587,34 +528,27 @@ static int derive_session_key(uint8_t key[32],
     return 0;
 }
 
-// ─── KC helpers ───────────────────────────────────────────────────────────────
-static void kc_transcript_hash(uint8_t th[32],
-                                const uint8_t device_id[32],
-                                const uint8_t a_c[32], const uint8_t s_c[32],
-                                const uint8_t nonce_c[32],
-                                const uint8_t eph_c[32],
-                                const uint8_t server_pub[32],
-                                const uint8_t a_s[32], const uint8_t s_s[32],
-                                const uint8_t nonce_s[32],
-                                const uint8_t eph_s[32]) {
+static void kc_transcript_hash(uint8_t th[32], const uint8_t device_id[32],
+                               const uint8_t a_c[32], const uint8_t s_c[32], const uint8_t nonce_c[32],
+                               const uint8_t eph_c[32], const uint8_t server_pub[32], const uint8_t a_s[32],
+                               const uint8_t s_s[32], const uint8_t nonce_s[32], const uint8_t eph_s[32]) {
     transcript_t tr;
     tr_init(&tr, "kc_v1");
-    tr_append(&tr, "device_id",  device_id,  32);
-    tr_append(&tr, "a_c",        a_c,         32);
-    tr_append(&tr, "s_c",        s_c,         32);
-    tr_append(&tr, "nonce_c",    nonce_c,     32);
-    tr_append(&tr, "eph_c",      eph_c,       32);
-    tr_append(&tr, "server_pub", server_pub,  32);
-    tr_append(&tr, "a_s",        a_s,         32);
-    tr_append(&tr, "s_s",        s_s,         32);
-    tr_append(&tr, "nonce_s",    nonce_s,     32);
-    tr_append(&tr, "eph_s",      eph_s,       32);
+    tr_append(&tr, "device_id",  device_id, 32);
+    tr_append(&tr, "a_c",        a_c,       32);
+    tr_append(&tr, "s_c",        s_c,       32);
+    tr_append(&tr, "nonce_c",    nonce_c,   32);
+    tr_append(&tr, "eph_c",      eph_c,     32);
+    tr_append(&tr, "server_pub", server_pub,32);
+    tr_append(&tr, "a_s",        a_s,       32);
+    tr_append(&tr, "s_s",        s_s,       32);
+    tr_append(&tr, "nonce_s",    nonce_s,   32);
+    tr_append(&tr, "eph_s",      eph_s,     32);
     crypto_hash_sha256(th, tr.buf, (unsigned long long)tr.len);
 }
 
 static void derive_kc_keys(uint8_t k_s2c[32], uint8_t k_c2s[32],
-                             const uint8_t session_key[32],
-                             const uint8_t th[32]) {
+                           const uint8_t session_key[32], const uint8_t th[32]) {
     uint8_t prk[32];
     hkdf_extract(prk, th, 32, session_key, 32);
     hkdf_expand(k_s2c, 32, prk, (const uint8_t *)"kc s2c", 6);
@@ -622,24 +556,19 @@ static void derive_kc_keys(uint8_t k_s2c[32], uint8_t k_c2s[32],
     sodium_memzero(prk, sizeof prk);
 }
 
-static void hmac_tag(uint8_t out[32], const uint8_t key[32],
-                      const char *label, const uint8_t th[32]) {
+static void hmac_tag(uint8_t out[32], const uint8_t key[32], const char *label, const uint8_t th[32]) {
     crypto_auth_hmacsha256_state st;
     crypto_auth_hmacsha256_init(&st, key, 32);
     crypto_auth_hmacsha256_update(&st, (const unsigned char *)label,
-                                   (unsigned long long)strlen(label));
+                                  (unsigned long long)strlen(label));
     crypto_auth_hmacsha256_update(&st, th, 32);
     crypto_auth_hmacsha256_final(&st, out);
 }
 
-// ─── ZTP bootstrap MAC ───────────────────────────────────────────────────────
-static void ztp_mac_transcript_hash(uint8_t out[32],
-                                     const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
-                                     const uint8_t device_id[32],
-                                     const uint8_t device_pub[32],
-                                     const uint8_t server_pub[32],
-                                     const uint8_t client_nonce[32],
-                                     const uint8_t server_nonce[32]) {
+static void ztp_mac_transcript_hash(uint8_t out[32], const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
+                                    const uint8_t device_id[32], const uint8_t device_pub[32],
+                                    const uint8_t server_pub[32], const uint8_t client_nonce[32],
+                                    const uint8_t server_nonce[32]) {
     transcript_t tr;
     tr_init(&tr, "ztp-bootstrap-v1");
     tr_append(&tr, "bootstrap_id", bootstrap_id, BOOTSTRAP_ID_LEN);
@@ -651,17 +580,12 @@ static void ztp_mac_transcript_hash(uint8_t out[32],
     crypto_hash_sha256(out, tr.buf, (unsigned long long)tr.len);
 }
 
-static void compute_bootstrap_mac(uint8_t out[32],
-                                   const uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN],
-                                   const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
-                                   const uint8_t device_id[32],
-                                   const uint8_t device_pub[32],
-                                   const uint8_t server_pub[32],
-                                   const uint8_t client_nonce[32],
-                                   const uint8_t server_nonce[32]) {
+static void compute_bootstrap_mac(uint8_t out[32], const uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN],
+                                  const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN], const uint8_t device_id[32],
+                                  const uint8_t device_pub[32], const uint8_t server_pub[32],
+                                  const uint8_t client_nonce[32], const uint8_t server_nonce[32]) {
     uint8_t th[32];
-    ztp_mac_transcript_hash(th, bootstrap_id, device_id, device_pub,
-                             server_pub, client_nonce, server_nonce);
+    ztp_mac_transcript_hash(th, bootstrap_id, device_id, device_pub, server_pub, client_nonce, server_nonce);
     crypto_auth_hmacsha256_state st;
     crypto_auth_hmacsha256_init(&st, bootstrap_secret, BOOTSTRAP_SECRET_LEN);
     crypto_auth_hmacsha256_update(&st, (const unsigned char *)"ztp-bootstrap-mac", 17);
@@ -670,7 +594,6 @@ static void compute_bootstrap_mac(uint8_t out[32],
     sodium_memzero(th, sizeof th);
 }
 
-// ─── TCP listen ───────────────────────────────────────────────────────────────
 static int listen_tcp(const char *ip, uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -698,33 +621,23 @@ static int parse_bind(const char *bind_str, char ip[64], uint16_t *port) {
     return 0;
 }
 
-// ─── Client handler ───────────────────────────────────────────────────────────
-static void handle_client(int cfd, const char *peer,
-                           reg_entry_t **reg, size_t *reg_n,
-                           bootstrap_entry_t **boot, size_t *boot_n,
-                           const uint8_t server_sk[32],
-                           const uint8_t server_pub[32],
-                           const pairing_policy_t *policy) {
+static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *reg_n,
+                          bootstrap_entry_t **boot, size_t *boot_n, const uint8_t server_sk[32],
+                          const uint8_t server_pub[32], const pairing_policy_t *policy) {
     double start_time = get_time_sec();
     size_t sent = 0, recv_bytes = 0;
 
     uint8_t msg_type;
     if (recv_u8(cfd, &msg_type, &recv_bytes) != 0) goto cleanup;
 
-    // ── MSG_SETUP ──────────────────────────────────────────────────────────────
     if (msg_type == MSG_SETUP) {
 
-        // [FIX-11] Receive pairing token FIRST (before any policy-sensitive data)
-        char token_buf[129]; // 128 + NUL
+        char token_buf[129];
         size_t token_len = 0;
         memset(token_buf, 0, sizeof token_buf);
-        if (recv_pairing_token(cfd, token_buf, &token_len, &recv_bytes) != 0)
-            goto cleanup;
+        if (recv_pairing_token(cfd, token_buf, &token_len, &recv_bytes) != 0) goto cleanup;
 
-        // [FIX-1] Enforce token policy with constant-time comparison
-        if (allows_ztp_setup(policy,
-                              token_len > 0 ? token_buf : NULL,
-                              token_len) != 0) {
+        if (allows_ztp_setup(policy, token_len > 0 ? token_buf : NULL, token_len) != 0) {
             fprintf(stderr, "Server[SETUP/ZTP]: pairing rejected by policy\n");
             goto cleanup;
         }
@@ -740,11 +653,10 @@ static void handle_client(int cfd, const char *peer,
         uint8_t device_id[32], device_pub[32], client_nonce[32];
 
         if (recv_all(cfd, bootstrap_id,  BOOTSTRAP_ID_LEN, &recv_bytes) != 0) goto cleanup;
-        if (recv_all(cfd, device_id,     32,                &recv_bytes) != 0) goto cleanup;
-        if (recv_all(cfd, device_pub,    32,                &recv_bytes) != 0) goto cleanup;
-        if (recv_all(cfd, client_nonce,  32,                &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, device_id,     32,               &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, device_pub,    32,               &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, client_nonce,  32,               &recv_bytes) != 0) goto cleanup;
 
-        // [FIX-7] Validate device_pub
         if (check_point(device_pub, "device_pub") != 0) goto cleanup;
 
         if (bootstrap_lookup(*boot, *boot_n, bootstrap_id, bootstrap_secret) != 0) {
@@ -771,7 +683,6 @@ static void handle_client(int cfd, const char *peer,
         if (recv_all(cfd, s,             32, &recv_bytes) != 0) goto cleanup;
         if (recv_all(cfd, bootstrap_mac, 32, &recv_bytes) != 0) goto cleanup;
 
-        // [FIX-7] Validate received proof commitment point
         if (check_point(A, "setup_A") != 0) goto cleanup;
 
         if (schnorr_verify_setup(device_id, device_pub, server_nonce, A, s) != 0) {
@@ -779,40 +690,52 @@ static void handle_client(int cfd, const char *peer,
             goto cleanup;
         }
 
-        compute_bootstrap_mac(expected_mac, bootstrap_secret, bootstrap_id,
-                               device_id, device_pub, server_pub,
-                               client_nonce, server_nonce);
+        compute_bootstrap_mac(expected_mac, bootstrap_secret, bootstrap_id, device_id, device_pub,
+                              server_pub, client_nonce, server_nonce);
 
-        // sodium_memcmp is already constant-time
         if (sodium_memcmp(expected_mac, bootstrap_mac, 32) != 0) {
             fprintf(stderr, "Server[SETUP/ZTP]: bootstrap MAC invalid\n");
+            sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
+            sodium_memzero(expected_mac, sizeof expected_mac);
             goto cleanup;
         }
 
         int upsert = reg_upsert(reg, reg_n, device_id, device_pub);
         if (upsert < 0) {
             fprintf(stderr, "Server[SETUP/ZTP]: registry update failed\n");
+            sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
+            sodium_memzero(expected_mac, sizeof expected_mac);
             goto cleanup;
         }
 
         char hex_id[65], hex_bid[65];
         sodium_bin2hex(hex_id,  sizeof hex_id,  device_id,    32);
-        sodium_bin2hex(hex_bid, sizeof hex_bid,  bootstrap_id, BOOTSTRAP_ID_LEN);
+        sodium_bin2hex(hex_bid, sizeof hex_bid, bootstrap_id, BOOTSTRAP_ID_LEN);
 
         if (upsert == 1)
-            printf("Server[SETUP/ZTP]: enrolled NEW device_id=%s bootstrap_id=%s\n",
-                   hex_id, hex_bid);
+            printf("Server[SETUP/ZTP]: enrolled NEW device_id=%s bootstrap_id=%s\n", hex_id, hex_bid);
         else
-            printf("Server[SETUP/ZTP]: validated existing device_id=%s bootstrap_id=%s\n",
-                   hex_id, hex_bid);
+            printf("Server[SETUP/ZTP]: validated existing device_id=%s bootstrap_id=%s\n", hex_id, hex_bid);
 
         sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
-        sodium_memzero(expected_mac,     sizeof expected_mac);
+        sodium_memzero(expected_mac, sizeof expected_mac);
 
-    // ── MSG_AUTH_V2 ───────────────────────────────────────────────────────────
+        /*
+         * [TOFU-FIX] Send enrollment acknowledgment (0x01).
+         *
+         * This byte is only reached after BOTH the Schnorr proof AND the
+         * bootstrap MAC verified successfully.  The MAC transcript includes
+         * server_pub, so a MITM that substituted a different key would cause
+         * MAC verification to fail above and we would jump to cleanup before
+         * ever reaching this send.  Therefore the client can safely treat
+         * receipt of 0x01 as proof that the server it connected to is the
+         * genuine holder of the server_pub it received.
+         */
+        uint8_t ack = 0x01;
+        if (send_all(cfd, &ack, 1, &sent) != 0) goto cleanup;
+
     } else if (msg_type == MSG_AUTH_V2) {
 
-        // 1. Anonymous X25519 ephemeral key exchange
         uint8_t client_pk[32];
         if (recv_all(cfd, client_pk, 32, &recv_bytes) != 0) goto cleanup;
 
@@ -822,44 +745,38 @@ static void handle_client(int cfd, const char *peer,
 
         if (send_all(cfd, srv_eph_pk, 32, &sent) != 0) goto cleanup;
 
-        uint8_t x25519_shared[32]; // [FIX-8] kept for session key binding
+        uint8_t x25519_shared[32];
         if (crypto_scalarmult(x25519_shared, srv_eph_sk, client_pk) != 0) {
             fprintf(stderr, "Server[AUTH]: invalid client X25519 key\n");
             goto cleanup;
         }
 
-        // Blake2b-512 key derivation (matches libsodium crypto_kx)
         uint8_t hash[64];
         crypto_generichash_state bst;
         crypto_generichash_init(&bst, NULL, 0, 64);
         crypto_generichash_update(&bst, x25519_shared, 32);
-        crypto_generichash_update(&bst, client_pk,     32);
-        crypto_generichash_update(&bst, srv_eph_pk,    32);
+        crypto_generichash_update(&bst, client_pk, 32);
+        crypto_generichash_update(&bst, srv_eph_pk, 32);
         crypto_generichash_final(&bst, hash, 64);
 
         uint8_t rx_key[32], tx_key[32];
-        memcpy(rx_key, hash + 32, 32); // C→S (server RX)
-        memcpy(tx_key, hash,      32); // S→C (server TX)
+        memcpy(rx_key, hash + 32, 32);
+        memcpy(tx_key, hash, 32);
 
-        // [FIX-9] Separate nonce counters per direction
         nonce_ctr_t nonce_rx = NONCE_CTR_INIT;
         nonce_ctr_t nonce_tx = NONCE_CTR_INIT;
 
-        // 2. Decrypt client identity payload
         uint32_t rx_len;
-        // [FIX-4] Bounded allocation
         uint8_t *rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes);
         if (!rx_ct) goto cleanup;
 
         uint8_t pt1[160];
         unsigned long long pt1_len;
         uint8_t nonce_rx_buf[12];
-        nonce_next(&nonce_rx, nonce_rx_buf); // [FIX-9] nonce = 0
+        nonce_next(&nonce_rx, nonce_rx_buf);
 
-        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt1, &pt1_len, NULL,
-                                                       rx_ct, rx_len,
-                                                       NULL, 0,
-                                                       nonce_rx_buf, rx_key) != 0) {
+        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt1, &pt1_len, NULL, rx_ct, rx_len,
+                                                      NULL, 0, nonce_rx_buf, rx_key) != 0) {
             fprintf(stderr, "Server[AUTH]: client payload decryption failed\n");
             free(rx_ct); goto cleanup;
         }
@@ -877,11 +794,9 @@ static void handle_client(int cfd, const char *peer,
         memcpy(nonce_c,   pt1 + 96,  32);
         memcpy(eph_c,     pt1 + 128, 32);
 
-        // [FIX-7] Validate received Ristretto points
         if (check_point(A_c,   "A_c")   != 0) goto cleanup;
         if (check_point(eph_c, "eph_c") != 0) goto cleanup;
 
-        // 3. Replay & Schnorr verification
         if (check_and_insert_replay(device_id, nonce_c) != 0) {
             fprintf(stderr, "Server[AUTH]: replay detected\n");
             goto cleanup;
@@ -893,13 +808,11 @@ static void handle_client(int cfd, const char *peer,
             goto cleanup;
         }
 
-        if (schnorr_verify_auth(device_id, expected_pub, A_c, s_c,
-                                 nonce_c, eph_c) != 0) {
+        if (schnorr_verify_auth(device_id, expected_pub, A_c, s_c, nonce_c, eph_c) != 0) {
             fprintf(stderr, "Server[AUTH]: client Schnorr proof invalid\n");
             goto cleanup;
         }
 
-        // 4. Build encrypted server response
         uint8_t nonce_s[32];
         randombytes_buf(nonce_s, 32);
 
@@ -910,21 +823,15 @@ static void handle_client(int cfd, const char *peer,
         uint8_t A_s[32], s_s[32];
         schnorr_prove_server(A_s, s_s, server_sk, server_pub, nonce_s, eph_s);
 
-        // [FIX-C1] Canonical order: eph_c first, eph_s second
-        // [FIX-8]  x25519_shared mixed in
         uint8_t session_key[32];
-        if (derive_session_key(session_key,
-                                eph_s_secret, eph_c,   // scalar, peer pub
-                                nonce_c, nonce_s, device_id,
-                                eph_c, eph_s,            // [FIX-C1]
-                                x25519_shared) != 0) {   // [FIX-8]
+        if (derive_session_key(session_key, eph_s_secret, eph_c, nonce_c, nonce_s, device_id,
+                               eph_c, eph_s, x25519_shared) != 0) {
             fprintf(stderr, "Server[AUTH]: session key derivation failed\n");
             goto cleanup;
         }
 
         uint8_t th[32];
-        kc_transcript_hash(th, device_id, A_c, s_c, nonce_c, eph_c,
-                            server_pub, A_s, s_s, nonce_s, eph_s);
+        kc_transcript_hash(th, device_id, A_c, s_c, nonce_c, eph_c, server_pub, A_s, s_s, nonce_s, eph_s);
 
         uint8_t k_s2c[32], k_c2s[32];
         derive_kc_keys(k_s2c, k_c2s, session_key, th);
@@ -941,33 +848,27 @@ static void handle_client(int cfd, const char *peer,
         memcpy(payload2 + 160, tag_s,      32);
 
         uint8_t nonce_tx_buf[12];
-        nonce_next(&nonce_tx, nonce_tx_buf); // [FIX-9] nonce = 0
+        nonce_next(&nonce_tx, nonce_tx_buf);
 
         uint8_t ct2[192 + crypto_aead_chacha20poly1305_IETF_ABYTES];
         unsigned long long ct2_len;
-        crypto_aead_chacha20poly1305_ietf_encrypt(ct2, &ct2_len,
-                                                   payload2, sizeof payload2,
-                                                   NULL, 0, NULL,
-                                                   nonce_tx_buf, tx_key);
+        crypto_aead_chacha20poly1305_ietf_encrypt(ct2, &ct2_len, payload2, sizeof payload2,
+                                                  NULL, 0, NULL, nonce_tx_buf, tx_key);
 
-        // [FIX-C2] Check return values
         if (send_u32_le(cfd, (uint32_t)ct2_len, &sent) != 0) goto cleanup;
         if (send_all(cfd, ct2, (size_t)ct2_len, &sent)  != 0) goto cleanup;
 
-        // 5. Decrypt and verify client finished tag
         uint32_t rx_len2;
-        // [FIX-4] Bounded allocation
         uint8_t *rx_ct2 = recv_encrypted_blob(cfd, &rx_len2, &recv_bytes);
         if (!rx_ct2) goto cleanup;
 
         uint8_t pt3[32];
         unsigned long long pt3_len;
-        nonce_next(&nonce_rx, nonce_rx_buf); // [FIX-9] nonce = 1
+        uint8_t nonce_rx_buf2[12];
+        nonce_next(&nonce_rx, nonce_rx_buf2);
 
-        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt3, &pt3_len, NULL,
-                                                       rx_ct2, rx_len2,
-                                                       NULL, 0,
-                                                       nonce_rx_buf, rx_key) != 0) {
+        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt3, &pt3_len, NULL, rx_ct2, rx_len2,
+                                                      NULL, 0, nonce_rx_buf2, rx_key) != 0) {
             fprintf(stderr, "Server[AUTH]: tag_c decryption failed\n");
             free(rx_ct2); goto cleanup;
         }
@@ -980,7 +881,6 @@ static void handle_client(int cfd, const char *peer,
 
         uint8_t expected_tag_c[32];
         hmac_tag(expected_tag_c, k_c2s, "client finished", th);
-        // sodium_memcmp is constant-time
         if (sodium_memcmp(expected_tag_c, pt3, 32) != 0) {
             fprintf(stderr, "Server[AUTH]: key confirmation failed (tag_c mismatch)\n");
             goto cleanup;
@@ -1011,7 +911,14 @@ cleanup:
            peer, dur * 1000.0, sent, recv_bytes);
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+static int load_or_create_server_sk(uint8_t server_sk[32]) {
+    if (file_exists(SERVER_SK_FILE)) {
+        return read_file_32(SERVER_SK_FILE, server_sk);
+    }
+    crypto_core_ristretto255_scalar_random(server_sk);
+    return write_file_32(SERVER_SK_FILE, server_sk);
+}
+
 int main(int argc, char **argv) {
     if (sodium_init() < 0) return 1;
 
@@ -1022,6 +929,7 @@ int main(int argc, char **argv) {
     uint8_t add_bootstrap_id[BOOTSTRAP_ID_LEN];
     uint8_t add_bootstrap_secret[BOOTSTRAP_SECRET_LEN];
     int have_add_bootstrap = 0;
+    int print_pubkey = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bind") && i + 1 < argc) {
@@ -1040,95 +948,115 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--add-bootstrap") && i + 2 < argc) {
             size_t bin_len = 0;
             if (sodium_hex2bin(add_bootstrap_id, sizeof add_bootstrap_id,
-                               argv[i+1], strlen(argv[i+1]),
-                               NULL, &bin_len, NULL) != 0 ||
+                               argv[i+1], strlen(argv[i+1]), NULL, &bin_len, NULL) != 0 ||
                 bin_len != BOOTSTRAP_ID_LEN) {
-                fprintf(stderr, "invalid bootstrap_id hex\n"); return 1;
+                fprintf(stderr, "invalid bootstrap_id hex\n");
+                return 1;
             }
             if (sodium_hex2bin(add_bootstrap_secret, sizeof add_bootstrap_secret,
-                               argv[i+2], strlen(argv[i+2]),
-                               NULL, &bin_len, NULL) != 0 ||
+                               argv[i+2], strlen(argv[i+2]), NULL, &bin_len, NULL) != 0 ||
                 bin_len != BOOTSTRAP_SECRET_LEN) {
-                fprintf(stderr, "invalid bootstrap_secret hex\n"); return 1;
+                fprintf(stderr, "invalid bootstrap_secret hex\n");
+                return 1;
             }
             have_add_bootstrap = 1;
             i += 2;
+        } else if (!strcmp(argv[i], "--print-pubkey")) {
+            print_pubkey = 1;
         } else {
             fprintf(stderr,
                     "Usage: %s [--bind 0.0.0.0:4000] [--pairing] "
                     "[--pairing-token TOKEN] [--pairing-seconds N] "
-                    "[--add-bootstrap <id_hex> <secret_hex>]\n", argv[0]);
+                    "[--add-bootstrap <id_hex> <secret_hex>] [--print-pubkey]\n", argv[0]);
             return 1;
         }
+    }
+
+    uint8_t server_sk[32];
+    if (load_or_create_server_sk(server_sk) != 0) {
+        fprintf(stderr, "failed reading/writing %s\n", SERVER_SK_FILE);
+        return 1;
+    }
+
+    uint8_t server_pub[32];
+    crypto_scalarmult_ristretto255_base(server_pub, server_sk);
+    if (crypto_core_ristretto255_is_valid_point(server_pub) != 1) {
+        fprintf(stderr, "server_pub is invalid — corrupt server_sk?\n");
+        return 1;
+    }
+
+    if (print_pubkey) {
+        char hex_pub[65];
+        sodium_bin2hex(hex_pub, sizeof hex_pub, server_pub, 32);
+        printf("%s\n", hex_pub);
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 0;
     }
 
     bootstrap_entry_t *boot = NULL;
     size_t boot_n = 0;
     if (load_bootstrap_db(&boot, &boot_n) != 0) {
-        fprintf(stderr, "Failed to load bootstrap DB\n"); return 1;
+        fprintf(stderr, "Failed to load bootstrap DB\n");
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
     }
 
     if (have_add_bootstrap) {
-        if (bootstrap_upsert(&boot, &boot_n,
-                              add_bootstrap_id, add_bootstrap_secret) < 0) {
-            fprintf(stderr, "Failed to update bootstrap DB\n"); return 1;
+        if (bootstrap_upsert(&boot, &boot_n, add_bootstrap_id, add_bootstrap_secret) < 0) {
+            fprintf(stderr, "Failed to update bootstrap DB\n");
+            free(boot);
+            sodium_memzero(server_sk, sizeof server_sk);
+            return 1;
         }
         char hex_bid[65];
         sodium_bin2hex(hex_bid, sizeof hex_bid, add_bootstrap_id, BOOTSTRAP_ID_LEN);
         printf("Server: added bootstrap_id=%s to %s\n", hex_bid, BOOTSTRAP_DB_FILE);
         sodium_memzero(add_bootstrap_secret, sizeof add_bootstrap_secret);
         free(boot);
+        sodium_memzero(server_sk, sizeof server_sk);
         return 0;
     }
 
-    // [FIX-5] Initialise two-generation replay cache
     if (replay_init() != 0) {
         fprintf(stderr, "Failed to initialise replay cache\n");
-        free(boot); return 1;
+        free(boot);
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
     }
 
-    char     ip[64];
+    char ip[64];
     uint16_t port;
     if (parse_bind(bind_str, ip, &port) != 0) {
-        fprintf(stderr, "bad --bind value\n"); free(boot); return 1;
-    }
-
-    uint8_t server_sk[32];
-    if (file_exists(SERVER_SK_FILE)) {
-        if (read_file_32(SERVER_SK_FILE, server_sk) != 0) {
-            fprintf(stderr, "failed reading %s\n", SERVER_SK_FILE);
-            free(boot); return 1;
-        }
-    } else {
-        crypto_core_ristretto255_scalar_random(server_sk);
-        if (write_file_32(SERVER_SK_FILE, server_sk) != 0) {
-            fprintf(stderr, "failed writing %s\n", SERVER_SK_FILE);
-            free(boot); return 1;
-        }
-    }
-
-    uint8_t server_pub[32];
-    crypto_scalarmult_ristretto255_base(server_pub, server_sk);
-    // [FIX-7] Sanity-check our own public key
-    if (crypto_core_ristretto255_is_valid_point(server_pub) != 1) {
-        fprintf(stderr, "server_pub is invalid — corrupt server_sk?\n");
-        free(boot); return 1;
+        fprintf(stderr, "bad --bind value\n");
+        free(boot);
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
     }
 
     reg_entry_t *reg = NULL;
     size_t reg_n = 0;
     if (load_registry(&reg, &reg_n) != 0) {
-        fprintf(stderr, "Failed to load registry\n"); free(boot); return 1;
+        fprintf(stderr, "Failed to load registry\n");
+        free(boot);
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
     }
 
     int lfd = listen_tcp(ip, port);
     if (lfd < 0) {
-        fprintf(stderr, "listen failed\n"); free(reg); free(boot); return 1;
+        fprintf(stderr, "listen failed\n");
+        free(reg);
+        free(boot);
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
     }
 
+    char hex_pub[65];
+    sodium_bin2hex(hex_pub, sizeof hex_pub, server_pub, 32);
+
     printf("C Server listening on %s\n", bind_str);
-    printf("Server: pairing_enabled=%s token_configured=%s "
-           "deadline=%s bootstrap_db_entries=%zu\n",
+    printf("Server public key (pin this on client): %s\n", hex_pub);
+    printf("Server: pairing_enabled=%s token_configured=%s deadline=%s bootstrap_db_entries=%zu\n",
            policy.enabled          ? "true" : "false",
            policy.token_configured ? "true" : "false",
            policy.deadline_sec > 0.0 ? "set" : "none",
@@ -1144,10 +1072,8 @@ int main(int argc, char **argv) {
         inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof peer_ip);
 
         char peer_str[64];
-        snprintf(peer_str, sizeof peer_str, "%s:%d",
-                 peer_ip, ntohs(peer_addr.sin_port));
+        snprintf(peer_str, sizeof peer_str, "%s:%d", peer_ip, ntohs(peer_addr.sin_port));
 
-        handle_client(cfd, peer_str, &reg, &reg_n,
-                       &boot, &boot_n, server_sk, server_pub, &policy);
+        handle_client(cfd, peer_str, &reg, &reg_n, &boot, &boot_n, server_sk, server_pub, &policy);
     }
 }
