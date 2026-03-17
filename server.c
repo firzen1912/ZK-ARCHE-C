@@ -2,14 +2,6 @@
 // server.c (ZK-ARCHE C Implementation)
 // ==============================
 //
-// [TOFU-FIX] After both Schnorr proof and bootstrap MAC verify, handle_client
-//   (MSG_SETUP branch) now sends a 1-byte enrollment acknowledgment (0x01) back
-//   to the client.  The client waits for this ack before pinning the server's
-//   public key — guaranteeing the key is only ever pinned after the server has
-//   confirmed the full exchange was authentic.  A MITM cannot produce a valid ack
-//   because the bootstrap MAC transcript includes server_pub, so substituting a
-//   different key breaks the MAC check and execution never reaches the send.
-//
 // Build:
 //   gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium -lssl -lcrypto
 
@@ -32,12 +24,12 @@
 #define MSG_SETUP    0x01
 #define MSG_AUTH_V2  0x03
 
-#define REGISTRY_BIN      "registry.bin"
-#define REGISTRY_BAK      "registry.bak"
-#define SERVER_SK_FILE    "server_sk.bin"
-#define SERVER_CERT_FILE  "server_cert.pem"
-#define SERVER_CERT_KEY_FILE "server_cert_key.pem"
-#define CA_CERT_FILE      "ca_cert.pem"
+#define REGISTRY_BIN          "/var/lib/iot-auth/server/registry.bin"
+#define REGISTRY_BAK          "/var/lib/iot-auth/server/registry.bak"
+#define SERVER_SK_FILE        "/var/lib/iot-auth/server/server_sk.bin"
+#define SERVER_CERT_FILE      "/var/lib/iot-auth/server/server_cert.pem"
+#define SERVER_CERT_KEY_FILE  "/var/lib/iot-auth/server/server_cert_key.pem"
+#define CA_CERT_FILE          "/var/lib/iot-auth/server/ca_cert.pem"
 #define MAX_ENCRYPTED_PAYLOAD  4096
 #define REPLAY_GEN_MAX  25000
 #define MAX_CERT_FILE_SIZE (128 * 1024)
@@ -711,8 +703,7 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         if (recv_pairing_token(cfd, token_buf, &token_len, &recv_bytes) != 0) goto cleanup;
 
         if (allows_ztp_setup(policy, token_len > 0 ? token_buf : NULL, token_len) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: pairing rejected by policy
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: pairing rejected by policy\n");
             goto cleanup;
         }
 
@@ -721,16 +712,14 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         if (recv_all(cfd, client_nonce, 32, &recv_bytes) != 0) goto cleanup;
         device_cert_buf = recv_blob(cfd, &device_cert_len, MAX_CERT_FILE_SIZE, &recv_bytes);
         if (!device_cert_buf) {
-            fprintf(stderr, "Server[SETUP/ZTP]: failed to receive device certificate
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: failed to receive device certificate");
             goto cleanup;
         }
         if (check_point(device_pub, "device_pub") != 0) goto cleanup;
 
         device_cert = load_cert_from_bytes(device_cert_buf, device_cert_len);
         if (!device_cert || verify_cert_against_ca(device_cert, ca_cert) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device certificate verification failed
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: device certificate verification failed");
             goto cleanup;
         }
 
@@ -738,14 +727,12 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         bin2hex_lower(device_pub, 32, expected_ou, sizeof expected_ou);
         if (cert_subject_field_hex(device_cert, NID_commonName, cert_cn, sizeof cert_cn) != 0 ||
             strcmp(cert_cn, expected_cn) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device certificate CN mismatch
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: device certificate CN mismatch");
             goto cleanup;
         }
         if (cert_subject_field_hex(device_cert, NID_organizationalUnitName, cert_ou, sizeof cert_ou) != 0 ||
             strcmp(cert_ou, expected_ou) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device certificate OU mismatch
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: device certificate OU mismatch");
             goto cleanup;
         }
 
@@ -754,8 +741,7 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
             int existing = reg_lookup(*reg, *reg_n, device_id, existing_pub);
             int is_new = (existing != 0);
             if (!is_new && sodium_memcmp(existing_pub, device_pub, 32) != 0) {
-                fprintf(stderr, "Server[SETUP/ZTP]: device_id collision
-");
+                fprintf(stderr, "Server[SETUP/ZTP]: device_id collision");
                 goto cleanup;
             }
         }
@@ -767,8 +753,7 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
             uint8_t *server_sig = NULL;
             size_t server_sig_len = 0;
             if (sign_transcript_hash(server_cert_key, transcript_hash, &server_sig, &server_sig_len) != 0) {
-                fprintf(stderr, "Server[SETUP/ZTP]: failed to sign setup transcript
-");
+                fprintf(stderr, "Server[SETUP/ZTP]: failed to sign setup transcript");
                 goto cleanup;
             }
             if (send_all(cfd, server_nonce, 32, &sent) != 0) { free(server_sig); goto cleanup; }
@@ -785,15 +770,13 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
 
         if (check_point(A, "setup_A") != 0) goto cleanup;
         if (schnorr_verify_setup(device_id, device_pub, server_nonce, A, s) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: Schnorr proof invalid
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: Schnorr proof invalid");
             goto cleanup;
         }
 
         device_cert_pubkey = X509_get_pubkey(device_cert);
         if (!device_cert_pubkey || verify_transcript_hash_sig(device_cert_pubkey, transcript_hash, device_sig, device_sig_len) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device transcript signature invalid
-");
+            fprintf(stderr, "Server[SETUP/ZTP]: device transcript signature invalid");
             goto cleanup;
         }
 

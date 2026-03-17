@@ -2,21 +2,6 @@
 // client.c (ZK-ARCHE C Implementation)
 // ==============================
 //
-// [TOFU-FIX] server_pub.bin is now OPTIONAL before running setup.
-//
-// First-contact flow (no server_pub.bin on disk):
-//   - Client receives server_pub from the server over the wire.
-//   - That key is bound into the bootstrap MAC transcript, so if a MITM
-//     substituted a different key the server's MAC check fails and it
-//     closes the connection without sending the 0x01 ack.
-//   - Client reads the 0x01 ack before writing server_pub.bin to disk.
-//   - If no ack arrives (connection closed / wrong byte), nothing is
-//     persisted — the MITM key is never stored.
-//
-// Re-enrollment flow (server_pub.bin already on disk):
-//   - The received key is compared to the pinned key (sodium_memcmp).
-//   - Any mismatch → immediate abort (MITM protection unchanged).
-//
 // Build:
 //   gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium -lssl -lcrypto
 
@@ -44,11 +29,11 @@
 #define MSG_AUTH_V2  0x03
 
 #define STATE_DIR              "/var/lib/iot-auth"
-#define DEVICE_ROOT_FILE       "/var/lib/iot-auth/device_root.bin"
-#define SERVER_PUB_FILE        "/var/lib/iot-auth/server_pub.bin"
-#define DEVICE_CERT_FILE       "/var/lib/iot-auth/device_cert.pem"
-#define DEVICE_KEY_FILE        "/var/lib/iot-auth/device_key.pem"
-#define CA_CERT_FILE           "/var/lib/iot-auth/ca_cert.pem"
+#define DEVICE_ROOT_FILE       "/var/lib/iot-auth/client/device_root.bin"
+#define SERVER_PUB_FILE        "/var/lib/iot-auth/client/server_pub.bin"
+#define DEVICE_CERT_FILE       "/var/lib/iot-auth/client/device_cert.pem"
+#define DEVICE_KEY_FILE        "/var/lib/iot-auth/client/device_key.pem"
+#define CA_CERT_FILE           "/var/lib/iot-auth/client/ca_cert.pem"
 #define MAX_ENCRYPTED_PAYLOAD  4096
 #define MAX_CERT_FILE_SIZE     (128 * 1024)
 #define MAX_SIG_SIZE           8192
@@ -138,6 +123,36 @@ static int load_device_creds_from_root(uint8_t device_id[32], uint8_t x[32], int
     return 0;
 }
 
+static int print_device_identity(void) {
+    uint8_t device_id[32], x[32], device_pub[32];
+    int created_root = 0;
+    char id_hex[65], pub_hex[65];
+
+    if (load_device_creds_from_root(device_id, x, &created_root) != 0) {
+        fprintf(stderr, "Failed loading/creating device root\n");
+        return -1;
+    }
+
+    crypto_scalarmult_ristretto255_base(device_pub, x);
+
+    sodium_bin2hex(id_hex, sizeof id_hex, device_id, 32);
+    sodium_bin2hex(pub_hex, sizeof pub_hex, device_pub, 32);
+
+    for (size_t i = 0; id_hex[i]; i++) {
+        if (id_hex[i] >= 'A' && id_hex[i] <= 'F') id_hex[i] = (char)(id_hex[i] - 'A' + 'a');
+    }
+    for (size_t i = 0; pub_hex[i]; i++) {
+        if (pub_hex[i] >= 'A' && pub_hex[i] <= 'F') pub_hex[i] = (char)(pub_hex[i] - 'A' + 'a');
+    }
+
+    printf("%s %s\n", id_hex, pub_hex);
+
+    sodium_memzero(x, sizeof x);
+    sodium_memzero(device_id, sizeof device_id);
+    sodium_memzero(device_pub, sizeof device_pub);
+    return 0;
+}
+
 static int creds_exist(void) { return file_exists(DEVICE_ROOT_FILE); }
 
 static uint8_t *read_file_all(const char *path, size_t *out_len, size_t max_len) {
@@ -211,6 +226,11 @@ static void ztp_cert_transcript_hash(uint8_t out[32],
     tr_append(&tr, "server_cert_hash", srv_hash, 32);
     crypto_hash_sha256(out, tr.buf, (unsigned long long)tr.len);
 }
+
+static int send_all(int fd, const uint8_t *buf, size_t len, size_t *sent_tracker);
+static int recv_all(int fd, uint8_t *buf, size_t len, size_t *recv_tracker);
+static int send_u32_le(int fd, uint32_t val, size_t *sent_tracker);
+static int recv_u32_le(int fd, uint32_t *val, size_t *recv_tracker);
 
 static int send_blob(int fd, const uint8_t *buf, uint32_t len, size_t *sent_tracker) {
     if (send_u32_le(fd, len, sent_tracker) != 0) return -1;
@@ -958,7 +978,8 @@ static void usage(const char *p) {
         "Usage:\n"
         "  %s --server 127.0.0.1:4000 --setup [--pairing-token TOKEN]\n"
         "  %s --server 127.0.0.1:4000\n"
-        "  %s --pin-server-pub <hex>\n", p, p, p);
+        "  %s --pin-server-pub <hex>\n"
+        "  %s --print-device-identity\n", p, p, p, p);
 }
 
 int main(int argc, char **argv) {
@@ -967,12 +988,15 @@ int main(int argc, char **argv) {
     const char *server = "127.0.0.1:4000";
     const char *pairing_token = NULL;
     int setup = 0;
+    int print_identity = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server") && i + 1 < argc) {
             server = argv[++i];
         } else if (!strcmp(argv[i], "--setup")) {
             setup = 1;
+        } else if (!strcmp(argv[i], "--print-device-identity")) {
+            print_identity = 1;
         } else if (!strcmp(argv[i], "--pairing-token") && i + 1 < argc) {
             pairing_token = argv[++i];
         } else if (!strcmp(argv[i], "--pin-server-pub") && i + 1 < argc) {
@@ -998,6 +1022,10 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    if (print_identity) {
+        return (print_device_identity() == 0) ? 0 : 1;
     }
 
     if (!creds_exist() && !setup) {

@@ -1,22 +1,42 @@
 #!/usr/bin/env bash
-# zk-arche.sh — ZK-ARCHE automation script (C version, mutual cert onboarding)
+# zk-arche.sh — ZK-ARCHE automation script (C version, /var/lib/iot-auth layout)
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+BASE_STATE_DIR="/var/lib/iot-auth"
+SERVER_STATE_DIR="${BASE_STATE_DIR}/server"
+CLIENT_STATE_DIR="${BASE_STATE_DIR}/client"
+GENERATED_DIR="${BASE_STATE_DIR}/generated"
+
 SERVER_BIN="${PROJECT_ROOT}/c_server"
 CLIENT_BIN="${PROJECT_ROOT}/c_client"
-CLIENT_STATE_DIR="/var/lib/iot-auth"
+
+CLIENT_DEVICE_ROOT="${CLIENT_STATE_DIR}/device_root.bin"
 CLIENT_SERVER_PUB="${CLIENT_STATE_DIR}/server_pub.bin"
 CLIENT_DEVICE_CERT="${CLIENT_STATE_DIR}/device_cert.pem"
 CLIENT_DEVICE_KEY="${CLIENT_STATE_DIR}/device_key.pem"
 CLIENT_CA_CERT="${CLIENT_STATE_DIR}/ca_cert.pem"
-SERVER_CERT="${PROJECT_ROOT}/server_cert.pem"
-SERVER_CERT_KEY="${PROJECT_ROOT}/server_cert_key.pem"
-SERVER_CA_CERT="${PROJECT_ROOT}/ca_cert.pem"
-SERVER_CA_KEY="${PROJECT_ROOT}/ca_key.pem"
-GEN_DEVICE_CERT="${PROJECT_ROOT}/device_cert.pem"
-GEN_DEVICE_KEY="${PROJECT_ROOT}/device_key.pem"
-SERVER_PUB_HEX_FILE="${PROJECT_ROOT}/server_pub.hex"
+
+SERVER_SK_FILE="${SERVER_STATE_DIR}/server_sk.bin"
+SERVER_PUB_HEX_FILE="${SERVER_STATE_DIR}/server_pub.hex"
+SERVER_REGISTRY="${SERVER_STATE_DIR}/registry.bin"
+SERVER_REGISTRY_BAK="${SERVER_STATE_DIR}/registry.bak"
+
+SERVER_CERT="${SERVER_STATE_DIR}/server_cert.pem"
+SERVER_CERT_KEY="${SERVER_STATE_DIR}/server_cert_key.pem"
+SERVER_CA_CERT="${SERVER_STATE_DIR}/ca_cert.pem"
+SERVER_CA_KEY="${SERVER_STATE_DIR}/ca_key.pem"
+
+GEN_DEVICE_CERT="${GENERATED_DIR}/device_cert.pem"
+GEN_DEVICE_KEY="${GENERATED_DIR}/device_key.pem"
+
+SERVER_CSR="${GENERATED_DIR}/server.csr"
+DEVICE_CSR="${GENERATED_DIR}/device.csr"
+CA_SERIAL="${GENERATED_DIR}/ca_cert.srl"
+
+IDENT_HELPER_SRC="${GENERATED_DIR}/.zk_arche_ident_helper.c"
+IDENT_HELPER_BIN="${GENERATED_DIR}/.zk_arche_ident_helper"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   _R='\033[0;31m' _G='\033[0;32m' _Y='\033[0;33m'
@@ -45,19 +65,245 @@ require_file() {
   [[ -f "$f" ]] || die "Required file not found: $f"
 }
 
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
 validate_hex32() {
   local val="$1" label="$2"
   [[ "$val" =~ ^[0-9a-fA-F]{64}$ ]] || die "$label must be exactly 32 bytes (64 hex characters)"
 }
 
+sudo_write_file() {
+  local src="$1" dst="$2" mode="$3"
+  sudo install -m "$mode" "$src" "$dst"
+}
+
+ensure_state_dirs() {
+  sudo mkdir -p "$BASE_STATE_DIR" "$SERVER_STATE_DIR" "$CLIENT_STATE_DIR" "$GENERATED_DIR"
+  sudo chmod 700 "$BASE_STATE_DIR" "$SERVER_STATE_DIR" "$CLIENT_STATE_DIR" "$GENERATED_DIR"
+}
+
 ensure_client_state_dir() {
-  sudo mkdir -p "$CLIENT_STATE_DIR"
+  ensure_state_dirs
+}
+
+ensure_server_state_dir() {
+  ensure_state_dirs
+}
+
+ensure_client_root() {
+  ensure_state_dirs
+  if ! sudo test -f "$CLIENT_DEVICE_ROOT"; then
+    log_step "Creating client device root at $CLIENT_DEVICE_ROOT"
+    local tmp
+    tmp="$(mktemp)"
+    openssl rand 32 > "$tmp"
+    sudo_write_file "$tmp" "$CLIENT_DEVICE_ROOT" 600
+    rm -f "$tmp"
+    log_ok "Created client device root"
+  fi
+}
+
+build_ident_helper() {
+  require_cmd gcc
+  cat > "$IDENT_HELPER_SRC" <<'EOF_HELPER'
+#include <sodium.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void bin2hex_lower(const uint8_t *in, size_t in_len, char *out, size_t out_len) {
+    sodium_bin2hex(out, out_len, in, in_len);
+    for (size_t i = 0; out[i]; i++) {
+        if (out[i] >= 'A' && out[i] <= 'F') out[i] = (char)(out[i] - 'A' + 'a');
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <device_root.bin>\n", argv[0]);
+        return 1;
+    }
+    if (sodium_init() < 0) {
+        fprintf(stderr, "sodium_init failed\n");
+        return 1;
+    }
+
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        perror("fopen");
+        return 1;
+    }
+
+    uint8_t root[32], device_id[32], wide[64], x[32], device_pub[32];
+    size_t n = fread(root, 1, sizeof root, f);
+    fclose(f);
+    if (n != sizeof root) {
+        fprintf(stderr, "device root must be exactly 32 bytes\n");
+        return 1;
+    }
+
+    crypto_generichash_state st;
+
+    crypto_generichash_init(&st, NULL, 0, 32);
+    crypto_generichash_update(&st, (const unsigned char *)"device-id", 9);
+    crypto_generichash_update(&st, root, 32);
+    crypto_generichash_final(&st, device_id, 32);
+
+    crypto_generichash_init(&st, NULL, 0, 64);
+    crypto_generichash_update(&st, (const unsigned char *)"device-auth-v1", 14);
+    crypto_generichash_update(&st, root, 32);
+    crypto_generichash_final(&st, wide, 64);
+
+    crypto_core_ristretto255_scalar_reduce(x, wide);
+    crypto_scalarmult_ristretto255_base(device_pub, x);
+
+    char id_hex[65], pub_hex[65];
+    bin2hex_lower(device_id, 32, id_hex, sizeof id_hex);
+    bin2hex_lower(device_pub, 32, pub_hex, sizeof pub_hex);
+
+    printf("%s %s\n", id_hex, pub_hex);
+
+    sodium_memzero(root, sizeof root);
+    sodium_memzero(wide, sizeof wide);
+    sodium_memzero(x, sizeof x);
+    return 0;
+}
+EOF_HELPER
+  gcc -O2 -std=c11 -Wall -Wextra "$IDENT_HELPER_SRC" -o "$IDENT_HELPER_BIN" -lsodium
+}
+
+derive_client_identity_hex() {
+  ensure_client_root
+  [[ -x "$IDENT_HELPER_BIN" ]] || build_ident_helper
+  sudo "$IDENT_HELPER_BIN" "$CLIENT_DEVICE_ROOT"
+}
+
+derive_server_pub_hex() {
+  require_bin "$SERVER_BIN"
+  ensure_server_state_dir
+  (
+    cd "$SERVER_STATE_DIR"
+    sudo "$SERVER_BIN" --print-pubkey
+  )
+}
+
+generate_bound_certs() {
+  require_bin "$SERVER_BIN"
+  require_cmd openssl
+
+  ensure_state_dirs
+  ensure_client_root
+
+  local derived
+  derived="$(derive_client_identity_hex)"
+  local device_id device_pub server_pub
+  device_id="$(awk '{print $1}' <<<"$derived")"
+  device_pub="$(awk '{print $2}' <<<"$derived")"
+  server_pub="$(derive_server_pub_hex)"
+
+  validate_hex32 "$device_id" "device_id"
+  validate_hex32 "$device_pub" "device_pub"
+  validate_hex32 "$server_pub" "server_pub"
+
+  log_header "Generating CA, server cert, and device cert"
+  log_val "device_id:" "$device_id"
+  log_val "device_pub:" "$device_pub"
+  log_val "server_pub:" "$server_pub"
+
+  rm -f "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY"
+  sudo rm -f "$SERVER_CA_KEY" "$SERVER_CA_CERT" "$SERVER_CERT" "$SERVER_CERT_KEY" \
+             "$SERVER_PUB_HEX_FILE" "${SERVER_STATE_DIR}/ca_cert.srl"
+
+  openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+    -keyout "$SERVER_CA_KEY.tmp" -out "$SERVER_CA_CERT.tmp" \
+    -subj "/CN=ZK-ARCHE Demo CA" >/dev/null 2>&1
+
+  openssl req -new -newkey rsa:3072 -nodes \
+    -keyout "$SERVER_CERT_KEY.tmp" -out "$SERVER_CSR" \
+    -subj "/CN=zk-arche-server/OU=${server_pub}" >/dev/null 2>&1
+
+  openssl x509 -req -in "$SERVER_CSR" \
+    -CA "$SERVER_CA_CERT.tmp" -CAkey "$SERVER_CA_KEY.tmp" -CAcreateserial \
+    -out "$SERVER_CERT.tmp" -days 825 -sha256 >/dev/null 2>&1
+
+  if [[ -f "./ca_cert.srl" ]]; then
+    mv -f "./ca_cert.srl" "$CA_SERIAL"
+  fi
+
+  openssl req -new -newkey rsa:3072 -nodes \
+    -keyout "$GEN_DEVICE_KEY" -out "$DEVICE_CSR" \
+    -subj "/CN=${device_id}/OU=${device_pub}" >/dev/null 2>&1
+
+  openssl x509 -req -in "$DEVICE_CSR" \
+    -CA "$SERVER_CA_CERT.tmp" -CAkey "$SERVER_CA_KEY.tmp" -CAcreateserial \
+    -out "$GEN_DEVICE_CERT" -days 825 -sha256 >/dev/null 2>&1
+
+  if [[ -f "./ca_cert.srl" ]]; then
+    mv -f "./ca_cert.srl" "$CA_SERIAL"
+  fi
+
+  printf '%s\n' "$server_pub" > "$SERVER_PUB_HEX_FILE.tmp"
+
+  sudo_write_file "$SERVER_CA_KEY.tmp" "$SERVER_CA_KEY" 600
+  sudo_write_file "$SERVER_CA_CERT.tmp" "$SERVER_CA_CERT" 644
+  sudo_write_file "$SERVER_CERT_KEY.tmp" "$SERVER_CERT_KEY" 600
+  sudo_write_file "$SERVER_CERT.tmp" "$SERVER_CERT" 644
+  sudo_write_file "$SERVER_PUB_HEX_FILE.tmp" "$SERVER_PUB_HEX_FILE" 644
+
+  rm -f "$SERVER_CA_KEY.tmp" "$SERVER_CA_CERT.tmp" "$SERVER_CERT_KEY.tmp" "$SERVER_CERT.tmp" "$SERVER_PUB_HEX_FILE.tmp"
+
+  chmod 600 "$GEN_DEVICE_KEY" 2>/dev/null || true
+  chmod 644 "$GEN_DEVICE_CERT" 2>/dev/null || true
+
+  log_ok "Generated matching CA/server/device certs"
+  log_val "CA cert:" "$SERVER_CA_CERT"
+  log_val "Server cert:" "$SERVER_CERT"
+  log_val "Server key:" "$SERVER_CERT_KEY"
+  log_val "Device cert:" "$GEN_DEVICE_CERT"
+  log_val "Device key:" "$GEN_DEVICE_KEY"
+}
+
+install_client_certs_from_generated() {
+  require_file "$GEN_DEVICE_CERT"
+  require_file "$GEN_DEVICE_KEY"
+  require_file "$SERVER_CA_CERT"
+
+  ensure_client_state_dir
+  sudo install -m 644 "$GEN_DEVICE_CERT" "$CLIENT_DEVICE_CERT"
+  sudo install -m 600 "$GEN_DEVICE_KEY" "$CLIENT_DEVICE_KEY"
+  sudo install -m 644 "$SERVER_CA_CERT" "$CLIENT_CA_CERT"
+  log_ok "Client cert material installed in $CLIENT_STATE_DIR"
+}
+
+ensure_existing_server_material() {
+  ensure_server_state_dir
+  require_file "$SERVER_CA_CERT"
+  require_file "$SERVER_CERT"
+  require_file "$SERVER_CERT_KEY"
+}
+
+ensure_existing_client_material() {
+  ensure_client_state_dir
+  require_file "$CLIENT_DEVICE_ROOT"
+  require_file "$CLIENT_DEVICE_CERT"
+  require_file "$CLIENT_DEVICE_KEY"
+  require_file "$CLIENT_CA_CERT"
+}
+
+ensure_existing_demo_material() {
+  require_bin "$SERVER_BIN"
+  require_bin "$CLIENT_BIN"
+  ensure_existing_server_material
+  ensure_existing_client_material
 }
 
 usage() {
   cat <<EOF2
 
-${_W}ZK-ARCHE automation script (C version)${_N}
+${_W}ZK-ARCHE automation script (C version, /var/lib/iot-auth layout)${_N}
 
 ${_C}USAGE${_N}
   ./zk-arche.sh <command> [options]
@@ -66,7 +312,7 @@ ${_C}BUILD${_N}
   build
 
 ${_C}CERTIFICATE COMMANDS${_N}
-  make-certs [--device-id <hex>] [--device-pub <hex>] [--server-pub <hex>]
+  make-certs
   install-client-certs
   check-server-certs
   check-client-certs
@@ -89,10 +335,18 @@ ${_C}COMBINED FLOWS${_N}
   full-device-onboard <server_ip:port> [--pairing-token <token>]
   reset-all
 
+${_C}RECOMMENDED LOCAL TEST FLOW${_N}
+  ./zk-arche.sh build
+  ./zk-arche.sh reset-all
+  ./zk-arche.sh make-certs
+  ./zk-arche.sh server-local 127.0.0.1:4000
+  ./zk-arche.sh client-local 127.0.0.1:4000
+
 EOF2
 }
 
 cmd_build() {
+  require_cmd gcc
   log_header "Building C binaries"
   gcc -O2 -std=c11 -Wall -Wextra "${PROJECT_ROOT}/server.c" -o "$SERVER_BIN" -lsodium -lssl -lcrypto
   gcc -O2 -std=c11 -Wall -Wextra "${PROJECT_ROOT}/client.c" -o "$CLIENT_BIN" -lsodium -lssl -lcrypto
@@ -101,65 +355,16 @@ cmd_build() {
 }
 
 cmd_make_certs() {
-  local device_id="$(openssl rand -hex 32)"
-  local device_pub="UNBOUND_DEVICE_STATIC_PUB"
-  local server_pub="UNBOUND_SERVER_STATIC_PUB"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --device-id)
-        [[ $# -ge 2 ]] || die "--device-id requires a value"
-        device_id="$2"; validate_hex32 "$device_id" "device_id"; shift 2 ;;
-      --device-pub)
-        [[ $# -ge 2 ]] || die "--device-pub requires a value"
-        device_pub="$2"; shift 2 ;;
-      --server-pub)
-        [[ $# -ge 2 ]] || die "--server-pub requires a value"
-        server_pub="$2"; shift 2 ;;
-      *) die "make-certs: unknown option: $1" ;;
-    esac
-  done
-
-  log_header "Generating CA, server cert, and device cert"
-
-  openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
-    -keyout "$SERVER_CA_KEY" -out "$SERVER_CA_CERT" \
-    -subj "/CN=ZK-ARCHE Demo CA" >/dev/null 2>&1
-
-  openssl req -new -newkey rsa:3072 -nodes \
-    -keyout "$SERVER_CERT_KEY" -out "${PROJECT_ROOT}/server.csr" \
-    -subj "/CN=zk-arche-server/OU=${server_pub}" >/dev/null 2>&1
-  openssl x509 -req -in "${PROJECT_ROOT}/server.csr" \
-    -CA "$SERVER_CA_CERT" -CAkey "$SERVER_CA_KEY" -CAcreateserial \
-    -out "$SERVER_CERT" -days 825 -sha256 >/dev/null 2>&1
-
-  openssl req -new -newkey rsa:3072 -nodes \
-    -keyout "$GEN_DEVICE_KEY" -out "${PROJECT_ROOT}/device.csr" \
-    -subj "/CN=${device_id}/OU=${device_pub}" >/dev/null 2>&1
-  openssl x509 -req -in "${PROJECT_ROOT}/device.csr" \
-    -CA "$SERVER_CA_CERT" -CAkey "$SERVER_CA_KEY" -CAcreateserial \
-    -out "$GEN_DEVICE_CERT" -days 825 -sha256 >/dev/null 2>&1
-
-  log_ok "Generated CA and enrollment certs"
-  log_val "CA cert:" "$SERVER_CA_CERT"
-  log_val "Server cert:" "$SERVER_CERT"
-  log_val "Server key:" "$SERVER_CERT_KEY"
-  log_val "Device cert:" "$GEN_DEVICE_CERT"
-  log_val "Device key:" "$GEN_DEVICE_KEY"
-  log_warn "If your C binaries strictly verify device_pub/server_pub binding, replace placeholder OU values with the exact protocol public keys."
+  require_bin "$SERVER_BIN"
+  require_bin "$CLIENT_BIN"
+  generate_bound_certs
+  install_client_certs_from_generated
 }
 
 cmd_install_client_certs() {
-  log_header "Installing client cert material"
-  require_file "$GEN_DEVICE_CERT"
-  require_file "$GEN_DEVICE_KEY"
-  require_file "$SERVER_CA_CERT"
-  ensure_client_state_dir
-  sudo cp "$GEN_DEVICE_CERT" "$CLIENT_DEVICE_CERT"
-  sudo cp "$GEN_DEVICE_KEY" "$CLIENT_DEVICE_KEY"
-  sudo cp "$SERVER_CA_CERT" "$CLIENT_CA_CERT"
-  sudo chmod 600 "$CLIENT_DEVICE_KEY"
-  log_ok "Client cert material installed in $CLIENT_STATE_DIR"
+  log_header "Installing client cert material from existing generated files"
+  require_bin "$CLIENT_BIN"
+  install_client_certs_from_generated
 }
 
 cmd_check_server_certs() {
@@ -168,44 +373,52 @@ cmd_check_server_certs() {
   _status_file "$SERVER_CA_KEY" "ca key"
   _status_file "$SERVER_CERT" "server cert"
   _status_file "$SERVER_CERT_KEY" "server cert key"
+  _status_file "$SERVER_SK_FILE" "server static key"
+  _status_file "$SERVER_REGISTRY" "device registry"
+  _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 }
 
 cmd_check_client_certs() {
   log_header "Client certificate files"
+  _status_file "$CLIENT_DEVICE_ROOT" "device root"
   _status_file "$CLIENT_DEVICE_CERT" "device cert"
   _status_file "$CLIENT_DEVICE_KEY" "device key"
   _status_file "$CLIENT_CA_CERT" "ca cert"
+  _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
 }
 
 cmd_start_server() {
   require_bin "$SERVER_BIN"
   [[ $# -ge 1 ]] || die "start-server requires <bind_addr>"
   local bind_addr="$1"; shift
-  require_file "$SERVER_CERT"
-  require_file "$SERVER_CERT_KEY"
-  require_file "$SERVER_CA_CERT"
+
+  ensure_existing_server_material
+
   log_header "Starting server"
   log_info "Bind: $bind_addr"
   [[ $# -gt 0 ]] && log_info "Flags: $*"
-  exec "$SERVER_BIN" --bind "$bind_addr" "$@"
+
+  cd "$SERVER_STATE_DIR"
+  exec sudo "$SERVER_BIN" --bind "$bind_addr" "$@"
 }
 
 cmd_server_local() {
   require_bin "$SERVER_BIN"
   [[ $# -eq 1 ]] || die "server-local requires <bind_addr>"
-  require_file "$SERVER_CERT"
-  require_file "$SERVER_CERT_KEY"
-  require_file "$SERVER_CA_CERT"
   local bind_addr="$1"
+
+  ensure_existing_demo_material
+
   log_header "Local test mode — server"
   log_info "Bind: $bind_addr"
   log_info "Pairing: enabled"
   echo
   log_info "In a second terminal run:"
-  echo -e "    ${_Y}./zk-arche.sh install-client-certs${_N}"
   echo -e "    ${_Y}./zk-arche.sh client-local $bind_addr${_N}"
   echo
-  exec "$SERVER_BIN" --bind "$bind_addr" --pairing
+
+  cd "$SERVER_STATE_DIR"
+  exec sudo "$SERVER_BIN" --bind "$bind_addr" --pairing
 }
 
 cmd_pin_server() {
@@ -213,20 +426,25 @@ cmd_pin_server() {
   [[ $# -eq 1 ]] || die "pin-server requires <server_pub_hex>"
   local server_pub="$1"
   validate_hex32 "$server_pub" "server_pub_hex"
+
   log_step "Pinning server public key..."
   "$CLIENT_BIN" --pin-server-pub "$server_pub"
-  printf '%s\n' "$server_pub" > "$SERVER_PUB_HEX_FILE"
+
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$server_pub" > "$tmp"
+  sudo_write_file "$tmp" "$SERVER_PUB_HEX_FILE" 644
+  rm -f "$tmp"
+
   log_ok "Server public key pinned"
 }
 
 cmd_setup_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -ge 1 ]] || die "setup-device requires <server_ip:port>"
-  require_file "$CLIENT_DEVICE_CERT"
-  require_file "$CLIENT_DEVICE_KEY"
-  require_file "$CLIENT_CA_CERT"
   local server_addr="$1"; shift
   local extra_flags=()
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pairing-token)
@@ -236,13 +454,16 @@ cmd_setup_device() {
     esac
   done
 
+  ensure_existing_client_material
+
   log_header "Device setup (mutual certificate onboarding)"
   log_info "Server: $server_addr"
   [[ ${#extra_flags[@]} -gt 0 ]] && log_info "Extra flags: ${extra_flags[*]}"
   "$CLIENT_BIN" --server "$server_addr" --setup "${extra_flags[@]}"
-  if [[ -f "$CLIENT_SERVER_PUB" ]]; then
+
+  if sudo test -f "$CLIENT_SERVER_PUB"; then
     local pinned_hex
-    pinned_hex="$(xxd -p -c 32 "$CLIENT_SERVER_PUB" 2>/dev/null || true)"
+    pinned_hex="$(sudo xxd -p -c 32 "$CLIENT_SERVER_PUB" 2>/dev/null || true)"
     log_ok "Device enrolled. Operational server key present."
     [[ -n "$pinned_hex" ]] && log_val "Fingerprint:" "$pinned_hex"
   else
@@ -253,6 +474,7 @@ cmd_setup_device() {
 cmd_auth_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -eq 1 ]] || die "auth-device requires <server_ip:port>"
+  ensure_existing_client_material
   log_header "Device authentication"
   log_info "Server: $1"
   "$CLIENT_BIN" --server "$1"
@@ -260,12 +482,12 @@ cmd_auth_device() {
 }
 
 cmd_show_pinned_key() {
-  if [[ ! -f "$CLIENT_SERVER_PUB" ]]; then
+  if ! sudo test -f "$CLIENT_SERVER_PUB"; then
     log_warn "No pinned server key found at: $CLIENT_SERVER_PUB"
     return
   fi
   local hex
-  hex="$(xxd -p -c 32 "$CLIENT_SERVER_PUB")"
+  hex="$(sudo xxd -p -c 32 "$CLIENT_SERVER_PUB")"
   log_ok "Pinned server public key:"
   log_val "File:" "$CLIENT_SERVER_PUB"
   log_val "Fingerprint:" "$hex"
@@ -273,9 +495,9 @@ cmd_show_pinned_key() {
 
 _status_file() {
   local path="$1" label="$2"
-  if [[ -f "$path" ]]; then
+  if sudo test -f "$path"; then
     local size
-    size="$(wc -c < "$path" | tr -d ' ')"
+    size="$(sudo wc -c < "$path" | tr -d ' ')"
     log_ok "$label: present (${size}B)"
   else
     log_warn "$label: absent"
@@ -288,31 +510,60 @@ cmd_status() {
   [[ -x "$SERVER_BIN" ]] && log_ok "c_server binary: $SERVER_BIN" || log_warn "c_server binary: not built ($SERVER_BIN)"
   [[ -x "$CLIENT_BIN" ]] && log_ok "c_client binary: $CLIENT_BIN" || log_warn "c_client binary: not built ($CLIENT_BIN)"
 
-  echo -e "\n${_W}Server state${_N}  ($PROJECT_ROOT)"
-  _status_file "${PROJECT_ROOT}/registry.bin" "device registry"
-  _status_file "${PROJECT_ROOT}/server_sk.bin" "server static key"
+  echo -e "\n${_W}State root${_N}"
+  log_val "path:" "$BASE_STATE_DIR"
+
+  echo -e "\n${_W}Server state${_N}  ($SERVER_STATE_DIR)"
+  _status_file "$SERVER_REGISTRY" "device registry"
+  _status_file "$SERVER_REGISTRY_BAK" "device registry backup"
+  _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_CA_CERT" "ca cert"
   _status_file "$SERVER_CA_KEY" "ca key"
   _status_file "$SERVER_CERT" "server cert"
   _status_file "$SERVER_CERT_KEY" "server cert key"
+  _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
+
+  if [[ -x "$SERVER_BIN" ]]; then
+    local spub
+    spub="$(derive_server_pub_hex 2>/dev/null || true)"
+    [[ -n "$spub" ]] && log_val "live server_pub:" "$spub"
+  fi
 
   echo -e "\n${_W}Client state${_N}  ($CLIENT_STATE_DIR)"
-  _status_file "${CLIENT_STATE_DIR}/device_root.bin" "device root"
+  _status_file "$CLIENT_DEVICE_ROOT" "device root"
   _status_file "$CLIENT_DEVICE_CERT" "device cert"
   _status_file "$CLIENT_DEVICE_KEY" "device key"
   _status_file "$CLIENT_CA_CERT" "ca cert"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
-  if [[ -f "$CLIENT_SERVER_PUB" ]]; then
-    local hex
-    hex="$(xxd -p -c 32 "$CLIENT_SERVER_PUB" 2>/dev/null || true)"
-    log_val "  fingerprint:" "$hex"
+
+  if sudo test -f "$CLIENT_DEVICE_ROOT"; then
+    local derived did dpub
+    derived="$(derive_client_identity_hex 2>/dev/null || true)"
+    did="$(awk '{print $1}' <<<"$derived")"
+    dpub="$(awk '{print $2}' <<<"$derived")"
+    [[ -n "$did" ]] && log_val "device_id:" "$did"
+    [[ -n "$dpub" ]] && log_val "device_pub:" "$dpub"
   fi
+
+  if sudo test -f "$CLIENT_SERVER_PUB"; then
+    local hex
+    hex="$(sudo xxd -p -c 32 "$CLIENT_SERVER_PUB" 2>/dev/null || true)"
+    [[ -n "$hex" ]] && log_val "pinned server_pub:" "$hex"
+  fi
+
+  echo -e "\n${_W}Generated files${_N}  ($GENERATED_DIR)"
+  if [[ -f "$GEN_DEVICE_CERT" ]]; then _status_file "$GEN_DEVICE_CERT" "generated device cert"; else log_warn "generated device cert: absent"; fi
+  if [[ -f "$GEN_DEVICE_KEY" ]]; then _status_file "$GEN_DEVICE_KEY" "generated device key"; else log_warn "generated device key: absent"; fi
+  if [[ -f "$SERVER_CSR" ]]; then _status_file "$SERVER_CSR" "server csr"; else log_warn "server csr: absent"; fi
+  if [[ -f "$DEVICE_CSR" ]]; then _status_file "$DEVICE_CSR" "device csr"; else log_warn "device csr: absent"; fi
+  if [[ -f "$CA_SERIAL" ]]; then _status_file "$CA_SERIAL" "ca serial"; else log_warn "ca serial: absent"; fi
 }
 
 cmd_client_local() {
   [[ $# -ge 1 ]] || die "client-local requires <server_ip:port>"
   local server_addr="$1"; shift
   local pairing_token_flags=()
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pairing-token)
@@ -321,9 +572,9 @@ cmd_client_local() {
       *) die "client-local: unknown option: $1" ;;
     esac
   done
-  require_file "$CLIENT_DEVICE_CERT"
-  require_file "$CLIENT_DEVICE_KEY"
-  require_file "$CLIENT_CA_CERT"
+
+  ensure_existing_demo_material
+
   log_header "Local onboarding — client terminal"
   log_info "Server: $server_addr"
   log_step "Running device setup..."
@@ -335,6 +586,7 @@ cmd_full_device_onboard() {
   [[ $# -ge 1 ]] || die "full-device-onboard requires <server_ip:port>"
   local server_addr="$1"; shift
   local setup_args=("$server_addr")
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pairing-token)
@@ -343,28 +595,32 @@ cmd_full_device_onboard() {
       *) die "full-device-onboard: unknown option: $1" ;;
     esac
   done
-  cmd_check_client_certs
+
+  ensure_existing_demo_material
   cmd_setup_device "${setup_args[@]}"
 }
 
 cmd_reset_client() {
   log_warn "Resetting client state: $CLIENT_STATE_DIR"
   sudo rm -rf "$CLIENT_STATE_DIR"
+  sudo mkdir -p "$CLIENT_STATE_DIR"
+  sudo chmod 700 "$CLIENT_STATE_DIR"
   log_ok "Client state removed"
 }
 
 cmd_reset_server() {
-  log_warn "Resetting server state in: $PROJECT_ROOT"
-  rm -f "${PROJECT_ROOT}/registry.bin" \
-        "${PROJECT_ROOT}/registry.bak" \
-        "${PROJECT_ROOT}/server_sk.bin" \
-        "${PROJECT_ROOT}/server_pub.bin" \
-        "${PROJECT_ROOT}/server_pub.hex" \
-        "$SERVER_CERT" "$SERVER_CERT_KEY" \
-        "$SERVER_CA_CERT" "$SERVER_CA_KEY" \
-        "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY" \
-        "${PROJECT_ROOT}/device.csr" "${PROJECT_ROOT}/server.csr" \
-        "${PROJECT_ROOT}/ca_cert.srl"
+  log_warn "Resetting server state in: $SERVER_STATE_DIR"
+  sudo rm -f "$SERVER_REGISTRY" \
+             "$SERVER_REGISTRY_BAK" \
+             "$SERVER_SK_FILE" \
+             "${SERVER_STATE_DIR}/server_pub.bin" \
+             "$SERVER_PUB_HEX_FILE" \
+             "$SERVER_CERT" "$SERVER_CERT_KEY" \
+             "$SERVER_CA_CERT" "$SERVER_CA_KEY" \
+             "${SERVER_STATE_DIR}/ca_cert.srl"
+  rm -f "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY" \
+        "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" \
+        "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN"
   log_ok "Server state removed"
 }
 
@@ -379,6 +635,7 @@ main() {
     usage
     exit 1
   fi
+
   local cmd="$1"; shift
   case "$cmd" in
     build) cmd_build "$@" ;;

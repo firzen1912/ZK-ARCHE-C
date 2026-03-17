@@ -53,3 +53,4 @@ Module.symvers
 Mkfile.old
 dkms.conf
 last_bootstrap.env
+artifacts/
