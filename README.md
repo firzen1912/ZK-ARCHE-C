@@ -1,26 +1,21 @@
 # ZK-ARCHE (C Implementation)
 
-Lightweight **Zero-Knowledge Proof Mutual Authentication** for IoT devices using **libsodium** and **OpenSSL**.
+Lightweight **Zero-Knowledge Proof Mutual Authentication** for IoT devices using **libsodium**.
 
-This C implementation targets **embedded / constrained environments** and now uses **mutual certificate-based onboarding** for Zero-Touch Provisioning. The setup path no longer relies on bootstrap secrets or first-contact TOFU for enrollment.
+This C implementation targets **embedded / constrained environments** and is **fully interoperable with the Rust ZK-ARCHE implementation**.
 
-The system supports:
-
-- **Mutual certificate-based Zero-Touch Provisioning (SETUP)**
-- **Schnorr-based mutual authentication** for the operational protocol
-- **An encrypted privacy-preserving transport tunnel** for `AUTH_V2`
-- **Optional pairing-token restricted enrollment windows**
+The system supports **Zero-Touch Provisioning (ZTP)** with Trust-On-First-Use (TOFU) server key discovery, **Schnorr-based mutual authentication**, and an **encrypted zero-privacy transport tunnel**.
 
 ---
 
 # Architecture
 
-| Component              | Role                  |
-| ---------------------- | --------------------- |
-| Raspberry Pi 3 / 4 / 5 | Provers (IoT devices) |
-| Ubuntu Server          | Verifier              |
-| Local CA               | Enrollment trust root |
-| Device Root Secret     | Persistent device identity |
+| Component              | Role                         |
+| ---------------------- | ---------------------------- |
+| Raspberry Pi 3 / 4 / 5 | Provers (IoT devices)        |
+| Ubuntu Server          | Verifier                     |
+| Bootstrap Registry     | Device provisioning database |
+| Device Root Secret     | Persistent device identity   |
 
 ---
 
@@ -38,36 +33,31 @@ The system supports:
 | Transcript        | Length-prefixed domain-separated  |
 | Constant-time ops | libsodium (`sodium_memcmp`)       |
 | Secret zeroising  | libsodium (`sodium_memzero`)      |
-| PKI / X.509       | OpenSSL                           |
 | Transport         | TCP                               |
-| Libraries         | libsodium, OpenSSL                |
+| Library           | libsodium                         |
 
 ---
 
 # Security Model
 
-The protocol now separates **onboarding trust** from **operational authentication**.
+The protocol separates **two identities** and uses a two-phase handshake.
 
 ---
 
-## 1. Mutual Certificate-Based Onboarding (Provisioning)
+## 1. Bootstrap Identity (Provisioning)
 
-Used during **Zero-Touch Provisioning (`--setup`)**.
+Used **once during Zero-Touch Provisioning (SETUP)**.
 
-During setup:
+The device proves knowledge of a pre-shared `bootstrap_secret` via an HMAC-SHA256 MAC. The MAC transcript binds:
 
-- the **device** presents a device certificate and proves possession of the matching private key
-- the **server** presents a server certificate and proves possession of the matching private key
-- both sides validate the presented certificate chain against a trusted CA
-- both sides sign the same setup transcript
-- the server only sends the `0x01` enrollment acknowledgment after all certificate, signature, and setup-proof checks pass
+```
+bootstrap_id  ||  device_id  ||  device_pub
+||  server_pub  ||  client_nonce  ||  server_nonce
+```
 
-This removes the prior dependency on:
+Because `server_pub` is included in the transcript, **a MITM cannot substitute the server's public key** without breaking the MAC check on the server side.
 
-- `bootstrap_id`
-- `bootstrap_secret`
-- `bootstrap_registry.bin`
-- TOFU as the root of trust for first setup
+Server validates against `bootstrap_registry.bin`. This enables **Zero-Touch Provisioning** with no manual key copying required.
 
 ---
 
@@ -75,26 +65,23 @@ This removes the prior dependency on:
 
 Derived deterministically from the device root secret:
 
-```text
+```
 device_root.bin  ->  device_id
               ->  device_private_scalar x
               ->  device_public_key = G * x
 ```
 
-Authentication still uses a **Schnorr ZKP** over an **anonymous X25519 encrypted tunnel** so the device identity is hidden from passive observers. Mutual authentication is confirmed with **key confirmation MACs** over the session transcript.
-
-In other words:
-
-- **certificates** authorize enrollment
-- **Schnorr + encrypted `AUTH_V2`** continue to protect the operational protocol
+Authentication uses a **Schnorr ZKP** over an **anonymous X25519 encrypted tunnel** so the device identity is hidden from passive observers. Mutual authentication is confirmed with **key confirmation MACs** (`server finished` + `client finished`) over the full session transcript.
 
 ---
 
-## 3. Server Identity Handling
+## 3. Server Key Discovery (TOFU)
 
-For onboarding, the client validates the **server certificate** immediately, so **TOFU is no longer required** for first setup.
+On first contact the client has no prior knowledge of the server's public key. The key is received over the wire and bound into the bootstrap MAC transcript. The server only sends a `0x01` enrollment acknowledgment **after** verifying the MAC against its own real public key.
 
-For compatibility with the existing `AUTH_V2` path, the client may still persist `server_pub.bin` after successful setup and may still support manual `--pin-server-pub`. That persisted value is now a compatibility anchor for the operational protocol, not the root of trust for enrollment.
+The client writes `server_pub.bin` to disk **only after receiving this ack** — so a MITM-substituted key is never pinned. On all subsequent connections the pinned key is enforced with `sodium_memcmp`.
+
+Manual out-of-band pinning via `--pin-server-pub` is still supported.
 
 ---
 
@@ -102,40 +89,34 @@ For compatibility with the existing `AUTH_V2` path, the client may still persist
 
 ## Client (Raspberry Pi)
 
-```text
+```
 /var/lib/iot-auth/
     device_root.bin
-    device_cert.pem
-    device_key.pem
-    ca_cert.pem
-    server_pub.bin
+    bootstrap_id.bin
+    bootstrap_secret.bin
+    server_pub.bin          <- auto-pinned via TOFU during first setup
 ```
 
-| File              | Purpose |
-| ----------------- | ------- |
-| `device_root.bin` | Persistent device root secret for operational identity |
-| `device_cert.pem` | Device enrollment certificate |
-| `device_key.pem`  | Device private key matching the device cert |
-| `ca_cert.pem`     | Trusted CA certificate used to validate the server |
-| `server_pub.bin`  | Compatibility pin for the operational server key |
+| File                   | Purpose                                             |
+| ---------------------- | --------------------------------------------------- |
+| `device_root.bin`      | Persistent device root secret (32 bytes)            |
+| `bootstrap_id.bin`     | Bootstrap identifier (32 bytes)                     |
+| `bootstrap_secret.bin` | Bootstrap credential (32 bytes)                     |
+| `server_pub.bin`       | Pinned verifier public key — written after TOFU ack |
 
 ## Server (Verifier)
 
-```text
+```
 registry.bin
 server_sk.bin
-server_cert.pem
-server_cert_key.pem
-ca_cert.pem
+bootstrap_registry.bin
 ```
 
-| File                | Purpose |
-| ------------------- | ------- |
-| `registry.bin`      | Enrolled device identities |
-| `server_sk.bin`     | Verifier static private key used by the operational protocol |
-| `server_cert.pem`   | Server enrollment certificate |
-| `server_cert_key.pem` | Server private key matching the server cert |
-| `ca_cert.pem`       | Trusted CA certificate used to validate device certs |
+| File                     | Purpose                       |
+| ------------------------ | ----------------------------- |
+| `registry.bin`           | Enrolled device identities    |
+| `server_sk.bin`          | Verifier static private key   |
+| `bootstrap_registry.bin` | Allowed bootstrap credentials |
 
 ---
 
@@ -145,7 +126,7 @@ ca_cert.pem
 
 ```bash
 sudo apt update
-sudo apt install build-essential libsodium-dev libssl-dev xxd openssl
+sudo apt install build-essential libsodium-dev xxd openssl
 ```
 
 ---
@@ -153,8 +134,8 @@ sudo apt install build-essential libsodium-dev libssl-dev xxd openssl
 # Compile
 
 ```bash
-gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium -lssl -lcrypto
-gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium -lssl -lcrypto
+gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium
+gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium
 ```
 
 Or use the automation script:
@@ -165,40 +146,25 @@ Or use the automation script:
 
 ---
 
-# Certificate Binding Convention
-
-The updated C onboarding flow expects the certificates to bind protocol identity data.
-
-Current convention used by the updated C sources:
-
-- device cert **CN** = lowercase hex of `device_id`
-- device cert **OU** = lowercase hex of compressed `device_pub`
-- server cert **OU** = lowercase hex of compressed `server_pub`
-
-This lets the certificate authorize the exact protocol identity being enrolled.
-
----
-
 # Automation Script
 
-All common operations can be run through `zk-arche.sh`:
+All operations can be run through `zk-arche.sh`:
 
-```text
+```
 Usage:
   ./zk-arche.sh build
-  ./zk-arche.sh make-certs [--device-id <hex>] [--device-pub <hex>] [--server-pub <hex>]
-  ./zk-arche.sh install-client-certs
-  ./zk-arche.sh check-server-certs
-  ./zk-arche.sh check-client-certs
+  ./zk-arche.sh add-bootstrap [<id_hex> <secret_hex>]
+  ./zk-arche.sh show-bootstrap
   ./zk-arche.sh start-server <bind_addr> [--pairing] [--pairing-token <t>] [--pairing-seconds <n>]
   ./zk-arche.sh server-local <bind_addr>
+  ./zk-arche.sh provision-bootstrap <id_hex> <secret_hex>
   ./zk-arche.sh setup-device <server_ip:port> [--pairing-token <t>]
   ./zk-arche.sh auth-device <server_ip:port>
   ./zk-arche.sh show-pinned-key
   ./zk-arche.sh pin-server <server_pub_hex>
   ./zk-arche.sh status
   ./zk-arche.sh client-local <server_ip:port> [--pairing-token <t>]
-  ./zk-arche.sh full-device-onboard <server_ip:port> [--pairing-token <t>]
+  ./zk-arche.sh full-device-onboard <server_ip:port> <id_hex> <secret_hex> [<server_pub_hex>]
   ./zk-arche.sh reset-client | reset-server | reset-all
 ```
 
@@ -208,28 +174,23 @@ Usage:
 
 ## Two-Machine Setup (Recommended)
 
-### Server machine
+No manual key exchange required. The server public key is auto-pinned via TOFU.
+
+**Server machine:**
 
 ```bash
 ./zk-arche.sh build
-./zk-arche.sh make-certs
+./zk-arche.sh add-bootstrap
+./zk-arche.sh show-bootstrap          # note BOOTSTRAP_ID and BOOTSTRAP_SECRET
 ./zk-arche.sh start-server 0.0.0.0:4000 --pairing
 ```
 
-### Client machine
-
-Copy or install the client-side certificate materials so these files exist:
-
-- `/var/lib/iot-auth/device_cert.pem`
-- `/var/lib/iot-auth/device_key.pem`
-- `/var/lib/iot-auth/ca_cert.pem`
-
-Then run:
+**Client machine** (paste the values from `show-bootstrap`):
 
 ```bash
 ./zk-arche.sh build
-./zk-arche.sh check-client-certs
-./zk-arche.sh setup-device <server_ip>:4000
+./zk-arche.sh provision-bootstrap <BOOTSTRAP_ID> <BOOTSTRAP_SECRET>
+./zk-arche.sh setup-device <server_ip>:4000     # server key auto-pinned via TOFU
 ./zk-arche.sh auth-device <server_ip>:4000
 ```
 
@@ -241,8 +202,7 @@ Then run:
 
 ```bash
 ./zk-arche.sh build
-./zk-arche.sh make-certs
-./zk-arche.sh install-client-certs
+./zk-arche.sh add-bootstrap
 ./zk-arche.sh server-local 127.0.0.1:4000
 ```
 
@@ -252,6 +212,8 @@ Then run:
 ./zk-arche.sh client-local 127.0.0.1:4000
 ./zk-arche.sh auth-device 127.0.0.1:4000
 ```
+
+`client-local` reads bootstrap values from `last_bootstrap.env` automatically.
 
 ---
 
@@ -271,28 +233,35 @@ To restrict which clients can enroll during a pairing window:
 
 ---
 
-## Optional: Manual Out-of-Band Operational Key Pinning
+## Optional: Manual Out-of-Band Key Pinning
 
-If you want to pin the server public key for the operational protocol before setup:
+If you prefer to pin the server public key before setup (skips TOFU):
 
 ```bash
+# The server prints its public key at startup:
+#   Server public key (pin this on client): <hex>
+
 ./zk-arche.sh pin-server <server_pub_hex>
 ./zk-arche.sh setup-device <server_ip>:4000
 ```
 
-This is optional for onboarding trust. The onboarding trust root is the CA and the server certificate.
-
 ---
 
 ## Raw Binary Usage (without script)
+
+**Server — register bootstrap credential:**
+```bash
+./c_server --add-bootstrap <bootstrap_id_hex> <bootstrap_secret_hex>
+```
 
 **Server — start with pairing window:**
 ```bash
 ./c_server --bind 0.0.0.0:4000 --pairing
 ```
 
-**Client — enroll with mutual certificate setup:**
+**Client — provision bootstrap + enroll:**
 ```bash
+./c_client --provision-bootstrap <bootstrap_id_hex> <bootstrap_secret_hex>
 ./c_client --server <server_ip>:4000 --setup
 ```
 
@@ -303,21 +272,25 @@ This is optional for onboarding trust. The onboarding trust root is the CA and t
 
 ---
 
-# `make-certs` Note
+# Example Deployment
 
-The integrated `make-certs` flow creates the CA, server cert, and client cert from one script.
+```
+Verifier:  Ubuntu Server    192.168.1.10
+Provers:   Raspberry Pi 3   192.168.1.101
+           Raspberry Pi 4   192.168.1.102
+           Raspberry Pi 5   192.168.1.103
+```
 
-If you do not pass explicit protocol public-key values to `make-certs`, the script may use placeholder values for certificate identity binding fields. If your final C sources strictly enforce `OU == device_pub/server_pub`, regenerate certs with the exact protocol public keys so the certificate subject fields match what the binaries verify.
+Each device is provisioned once with a unique bootstrap credential. After enrollment it authenticates repeatedly using its Schnorr ZKP identity — the bootstrap credential is never used again.
 
 ---
 
 # Inspecting State
 
 ```bash
-./zk-arche.sh status
-./zk-arche.sh check-server-certs
-./zk-arche.sh check-client-certs
-./zk-arche.sh show-pinned-key
+./zk-arche.sh status           # shows all file presence, bootstrap values, pinned key
+./zk-arche.sh show-bootstrap   # print last generated bootstrap credential
+./zk-arche.sh show-pinned-key  # print the server pub fingerprint pinned on this client
 ```
 
 ---
@@ -325,7 +298,11 @@ If you do not pass explicit protocol public-key values to `make-certs`, the scri
 # Reset Environment
 
 ```bash
-./zk-arche.sh reset-all
+./zk-arche.sh reset-all        # wipes both client and server state
+
+# Or individually:
+./zk-arche.sh reset-client     # removes /var/lib/iot-auth
+./zk-arche.sh reset-server     # removes registry, bootstrap db, server key files
 ```
 
 Manual equivalents:
@@ -336,9 +313,9 @@ sudo rm -rf /var/lib/iot-auth
 
 # Server
 rm -f registry.bin registry.bak \
+      bootstrap_registry.bin bootstrap_registry.bak \
       server_sk.bin server_pub.bin server_pub.hex \
-      server_cert.pem server_cert_key.pem ca_cert.pem ca_key.pem \
-      device_cert.pem device_key.pem device.csr server.csr ca_cert.srl
+      last_bootstrap.env
 ```
 
 ---
@@ -347,9 +324,9 @@ rm -f registry.bin registry.bak \
 
 This project is a **research prototype** for:
 
-- IoT authentication protocols
-- Zero-knowledge identification systems
-- Cross-language cryptographic interoperability
-- Evaluation on constrained devices (Raspberry Pi, embedded Linux)
+* IoT authentication protocols
+* Zero-knowledge identification systems
+* Cross-language cryptographic interoperability
+* Evaluation on constrained devices (Raspberry Pi, embedded Linux)
 
 Not intended for production deployment without additional hardening.

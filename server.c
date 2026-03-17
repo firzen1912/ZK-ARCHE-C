@@ -2,8 +2,16 @@
 // server.c (ZK-ARCHE C Implementation)
 // ==============================
 //
+// [TOFU-FIX] After both Schnorr proof and bootstrap MAC verify, handle_client
+//   (MSG_SETUP branch) now sends a 1-byte enrollment acknowledgment (0x01) back
+//   to the client.  The client waits for this ack before pinning the server's
+//   public key — guaranteeing the key is only ever pinned after the server has
+//   confirmed the full exchange was authentic.  A MITM cannot produce a valid ack
+//   because the bootstrap MAC transcript includes server_pub, so substituting a
+//   different key breaks the MAC check and execution never reaches the send.
+//
 // Build:
-//   gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium -lssl -lcrypto
+//   gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium
 
 #define _POSIX_C_SOURCE 200112L
 #include <sodium.h>
@@ -15,25 +23,19 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <openssl/x509_vfy.h>
-#include <openssl/evp.h>
-#include <openssl/err.h>
 
 #define MSG_SETUP    0x01
 #define MSG_AUTH_V2  0x03
 
-#define REGISTRY_BIN          "/var/lib/iot-auth/server/registry.bin"
-#define REGISTRY_BAK          "/var/lib/iot-auth/server/registry.bak"
-#define SERVER_SK_FILE        "/var/lib/iot-auth/server/server_sk.bin"
-#define SERVER_CERT_FILE      "/var/lib/iot-auth/server/server_cert.pem"
-#define SERVER_CERT_KEY_FILE  "/var/lib/iot-auth/server/server_cert_key.pem"
-#define CA_CERT_FILE          "/var/lib/iot-auth/server/ca_cert.pem"
+#define REGISTRY_BIN      "registry.bin"
+#define REGISTRY_BAK      "registry.bak"
+#define SERVER_SK_FILE    "server_sk.bin"
+#define BOOTSTRAP_DB_FILE "bootstrap_registry.bin"
+#define BOOTSTRAP_DB_BAK  "bootstrap_registry.bak"
+#define BOOTSTRAP_ID_LEN      32
+#define BOOTSTRAP_SECRET_LEN  32
 #define MAX_ENCRYPTED_PAYLOAD  4096
 #define REPLAY_GEN_MAX  25000
-#define MAX_CERT_FILE_SIZE (128 * 1024)
-#define MAX_SIG_SIZE 8192
 
 typedef struct { uint64_t count; } nonce_ctr_t;
 #define NONCE_CTR_INIT { 0 }
@@ -176,6 +178,82 @@ static int reg_upsert(reg_entry_t **arrp, size_t *np,
     n++;
     *arrp = arr; *np = n;
     return (save_registry(arr, n) == 0) ? 1 : -1;
+}
+
+typedef struct {
+    uint8_t id[BOOTSTRAP_ID_LEN];
+    uint8_t secret[BOOTSTRAP_SECRET_LEN];
+} bootstrap_entry_t;
+
+static int load_bootstrap_db(bootstrap_entry_t **out, size_t *out_n) {
+    *out = NULL; *out_n = 0;
+    if (!file_exists(BOOTSTRAP_DB_FILE)) return 0;
+    FILE *f = fopen(BOOTSTRAP_DB_FILE, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0 || (sz % 64) != 0) { fclose(f); return -1; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
+    size_t n = (size_t)sz / 64;
+    if (n == 0) { fclose(f); return 0; }
+    bootstrap_entry_t *arr = calloc(n, sizeof *arr);
+    if (!arr) { fclose(f); return -1; }
+    for (size_t i = 0; i < n; i++) {
+        if (fread(arr[i].id,     1, 32, f) != 32 ||
+            fread(arr[i].secret, 1, 32, f) != 32) {
+            fclose(f); free(arr); return -1;
+        }
+    }
+    fclose(f);
+    *out = arr; *out_n = n;
+    return 0;
+}
+
+static int save_bootstrap_db(const bootstrap_entry_t *arr, size_t n) {
+    if (file_exists(BOOTSTRAP_DB_FILE)) rename(BOOTSTRAP_DB_FILE, BOOTSTRAP_DB_BAK);
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s.tmp", BOOTSTRAP_DB_FILE);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (fwrite(arr[i].id,     1, 32, f) != 32 ||
+            fwrite(arr[i].secret, 1, 32, f) != 32) {
+            fclose(f); return -1;
+        }
+    }
+    fflush(f); fsync(fileno(f)); fclose(f);
+    return rename(tmp, BOOTSTRAP_DB_FILE);
+}
+
+static int bootstrap_lookup(const bootstrap_entry_t *arr, size_t n,
+                            const uint8_t id[32], uint8_t secret_out[32]) {
+    for (size_t i = 0; i < n; i++) {
+        if (sodium_memcmp(arr[i].id, id, 32) == 0) {
+            memcpy(secret_out, arr[i].secret, 32);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int bootstrap_upsert(bootstrap_entry_t **arrp, size_t *np,
+                            const uint8_t id[32], const uint8_t secret[32]) {
+    bootstrap_entry_t *arr = *arrp;
+    size_t n = *np;
+    for (size_t i = 0; i < n; i++) {
+        if (sodium_memcmp(arr[i].id, id, 32) == 0) {
+            memcpy(arr[i].secret, secret, 32);
+            return save_bootstrap_db(arr, n);
+        }
+    }
+    bootstrap_entry_t *b = realloc(arr, (n + 1) * sizeof *b);
+    if (!b) return -1;
+    arr = b;
+    memcpy(arr[n].id,     id,     32);
+    memcpy(arr[n].secret, secret, 32);
+    n++;
+    *arrp = arr; *np = n;
+    return save_bootstrap_db(arr, n);
 }
 
 typedef struct { uint8_t key[64]; } replay_key_t;
@@ -487,169 +565,35 @@ static void hmac_tag(uint8_t out[32], const uint8_t key[32], const char *label, 
     crypto_auth_hmacsha256_final(&st, out);
 }
 
-static void ztp_cert_transcript_hash(uint8_t out[32],
-                                   const uint8_t device_id[32], const uint8_t device_pub[32],
-                                   const uint8_t client_nonce[32], const uint8_t server_nonce[32],
-                                   const uint8_t *device_cert, uint32_t device_cert_len,
-                                   const uint8_t *server_cert, uint32_t server_cert_len) {
-    uint8_t dev_hash[32], srv_hash[32];
+static void ztp_mac_transcript_hash(uint8_t out[32], const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN],
+                                    const uint8_t device_id[32], const uint8_t device_pub[32],
+                                    const uint8_t server_pub[32], const uint8_t client_nonce[32],
+                                    const uint8_t server_nonce[32]) {
     transcript_t tr;
-    crypto_hash_sha256(dev_hash, device_cert, device_cert_len);
-    crypto_hash_sha256(srv_hash, server_cert, server_cert_len);
-    tr_init(&tr, "ztp-mutual-cert-v1");
-    tr_append(&tr, "device_id", device_id, 32);
-    tr_append(&tr, "device_pub", device_pub, 32);
+    tr_init(&tr, "ztp-bootstrap-v1");
+    tr_append(&tr, "bootstrap_id", bootstrap_id, BOOTSTRAP_ID_LEN);
+    tr_append(&tr, "device_id",    device_id,    32);
+    tr_append(&tr, "device_pub",   device_pub,   32);
+    tr_append(&tr, "server_pub",   server_pub,   32);
     tr_append(&tr, "client_nonce", client_nonce, 32);
     tr_append(&tr, "server_nonce", server_nonce, 32);
-    tr_append(&tr, "device_cert_hash", dev_hash, 32);
-    tr_append(&tr, "server_cert_hash", srv_hash, 32);
     crypto_hash_sha256(out, tr.buf, (unsigned long long)tr.len);
 }
 
-static int send_blob(int fd, const uint8_t *buf, uint32_t len, size_t *sent_tracker) {
-    if (send_u32_le(fd, len, sent_tracker) != 0) return -1;
-    return len ? send_all(fd, buf, len, sent_tracker) : 0;
+static void compute_bootstrap_mac(uint8_t out[32], const uint8_t bootstrap_secret[BOOTSTRAP_SECRET_LEN],
+                                  const uint8_t bootstrap_id[BOOTSTRAP_ID_LEN], const uint8_t device_id[32],
+                                  const uint8_t device_pub[32], const uint8_t server_pub[32],
+                                  const uint8_t client_nonce[32], const uint8_t server_nonce[32]) {
+    uint8_t th[32];
+    ztp_mac_transcript_hash(th, bootstrap_id, device_id, device_pub, server_pub, client_nonce, server_nonce);
+    crypto_auth_hmacsha256_state st;
+    crypto_auth_hmacsha256_init(&st, bootstrap_secret, BOOTSTRAP_SECRET_LEN);
+    crypto_auth_hmacsha256_update(&st, (const unsigned char *)"ztp-bootstrap-mac", 17);
+    crypto_auth_hmacsha256_update(&st, th, 32);
+    crypto_auth_hmacsha256_final(&st, out);
+    sodium_memzero(th, sizeof th);
 }
 
-static uint8_t *recv_blob(int fd, uint32_t *out_len, uint32_t max_len, size_t *recv_tracker) {
-    uint32_t n;
-    uint8_t *buf;
-    if (recv_u32_le(fd, &n, recv_tracker) != 0) return NULL;
-    if (n > max_len) return NULL;
-    buf = malloc(n == 0 ? 1 : n);
-    if (!buf) return NULL;
-    if (n && recv_all(fd, buf, n, recv_tracker) != 0) { free(buf); return NULL; }
-    *out_len = n;
-    return buf;
-}
-
-static void bin2hex_lower(const uint8_t *in, size_t in_len, char *out, size_t out_len) {
-    sodium_bin2hex(out, out_len, in, in_len);
-    for (size_t i = 0; out[i]; i++) if (out[i] >= 'A' && out[i] <= 'F') out[i] = (char)(out[i] - 'A' + 'a');
-}
-
-static uint8_t *read_file_all(const char *path, size_t *out_len, size_t max_len) {
-    FILE *f = fopen(path, "rb");
-    uint8_t *buf = NULL;
-    long sz;
-    size_t n;
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    sz = ftell(f);
-    if (sz < 0 || (size_t)sz > max_len) { fclose(f); return NULL; }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
-    buf = malloc((size_t)sz == 0 ? 1 : (size_t)sz);
-    if (!buf) { fclose(f); return NULL; }
-    n = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    if (n != (size_t)sz) { free(buf); return NULL; }
-    *out_len = n;
-    return buf;
-}
-
-static X509 *load_cert_from_bytes(const uint8_t *buf, size_t len) {
-    BIO *bio = BIO_new_mem_buf(buf, (int)len);
-    X509 *cert = NULL;
-    if (!bio) return NULL;
-    cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    if (!cert) {
-        BIO_free(bio);
-        bio = BIO_new_mem_buf(buf, (int)len);
-        if (!bio) return NULL;
-        cert = d2i_X509_bio(bio, NULL);
-    }
-    BIO_free(bio);
-    return cert;
-}
-
-static EVP_PKEY *load_private_key_from_bytes(const uint8_t *buf, size_t len) {
-    BIO *bio = BIO_new_mem_buf(buf, (int)len);
-    EVP_PKEY *pkey = NULL;
-    if (!bio) return NULL;
-    pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    if (!pkey) {
-        BIO_free(bio);
-        bio = BIO_new_mem_buf(buf, (int)len);
-        if (!bio) return NULL;
-        pkey = d2i_PrivateKey_bio(bio, NULL);
-    }
-    BIO_free(bio);
-    return pkey;
-}
-
-static int verify_cert_against_ca(X509 *cert, X509 *ca_cert) {
-    X509_STORE *store = X509_STORE_new();
-    X509_STORE_CTX *ctx = X509_STORE_CTX_new();
-    int ok = 0;
-    if (!store || !ctx) goto done;
-    if (X509_STORE_add_cert(store, ca_cert) != 1) goto done;
-    if (X509_STORE_CTX_init(ctx, store, cert, NULL) != 1) goto done;
-    ok = (X509_verify_cert(ctx) == 1) ? 0 : -1;
- done:
-    if (ctx) X509_STORE_CTX_free(ctx);
-    if (store) X509_STORE_free(store);
-    return ok;
-}
-
-static int cert_subject_field_hex(X509 *cert, int nid, char *out, size_t out_len) {
-    X509_NAME *name = X509_get_subject_name(cert);
-    int n;
-    if (!name) return -1;
-    n = X509_NAME_get_text_by_NID(name, nid, out, (int)out_len);
-    if (n < 0 || (size_t)n >= out_len) return -1;
-    for (int i = 0; out[i]; i++) if (out[i] >= 'A' && out[i] <= 'F') out[i] = (char)(out[i] - 'A' + 'a');
-    return 0;
-}
-
-static int sign_transcript_hash(EVP_PKEY *pkey, const uint8_t th[32], uint8_t **sig_out, size_t *sig_len_out) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    size_t sig_len = 0;
-    uint8_t *sig = NULL;
-    int pkey_id;
-    if (!ctx) return -1;
-    pkey_id = EVP_PKEY_base_id(pkey);
-    if (pkey_id == EVP_PKEY_ED25519 || pkey_id == EVP_PKEY_ED448) {
-        if (EVP_DigestSignInit(ctx, NULL, NULL, NULL, pkey) != 1) goto err;
-        if (EVP_DigestSign(ctx, NULL, &sig_len, th, 32) != 1) goto err;
-        sig = malloc(sig_len ? sig_len : 1);
-        if (!sig) goto err;
-        if (EVP_DigestSign(ctx, sig, &sig_len, th, 32) != 1) goto err;
-    } else {
-        if (EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, pkey) != 1) goto err;
-        if (EVP_DigestSignUpdate(ctx, th, 32) != 1) goto err;
-        if (EVP_DigestSignFinal(ctx, NULL, &sig_len) != 1) goto err;
-        sig = malloc(sig_len ? sig_len : 1);
-        if (!sig) goto err;
-        if (EVP_DigestSignFinal(ctx, sig, &sig_len) != 1) goto err;
-    }
-    EVP_MD_CTX_free(ctx);
-    *sig_out = sig;
-    *sig_len_out = sig_len;
-    return 0;
- err:
-    EVP_MD_CTX_free(ctx);
-    free(sig);
-    return -1;
-}
-
-static int verify_transcript_hash_sig(EVP_PKEY *pkey, const uint8_t th[32], const uint8_t *sig, size_t sig_len) {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    int ok = -1;
-    int pkey_id;
-    if (!ctx) return -1;
-    pkey_id = EVP_PKEY_base_id(pkey);
-    if (pkey_id == EVP_PKEY_ED25519 || pkey_id == EVP_PKEY_ED448) {
-        if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) != 1) goto done;
-        ok = (EVP_DigestVerify(ctx, sig, sig_len, th, 32) == 1) ? 0 : -1;
-    } else {
-        if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) != 1) goto done;
-        if (EVP_DigestVerifyUpdate(ctx, th, 32) != 1) goto done;
-        ok = (EVP_DigestVerifyFinal(ctx, sig, sig_len) == 1) ? 0 : -1;
-    }
- done:
-    EVP_MD_CTX_free(ctx);
-    return ok;
-}
 static int listen_tcp(const char *ip, uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -678,9 +622,8 @@ static int parse_bind(const char *bind_str, char ip[64], uint16_t *port) {
 }
 
 static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *reg_n,
-                          const uint8_t server_sk[32], const uint8_t server_pub[32],
-                          const pairing_policy_t *policy, const uint8_t *server_cert_buf, size_t server_cert_len,
-                          EVP_PKEY *server_cert_key, X509 *server_cert, X509 *ca_cert) {
+                          bootstrap_entry_t **boot, size_t *boot_n, const uint8_t server_sk[32],
+                          const uint8_t server_pub[32], const pairing_policy_t *policy) {
     double start_time = get_time_sec();
     size_t sent = 0, recv_bytes = 0;
 
@@ -689,16 +632,8 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
 
     if (msg_type == MSG_SETUP) {
 
-        char token_buf[129], expected_cn[65], expected_ou[65], cert_cn[128], cert_ou[128];
+        char token_buf[129];
         size_t token_len = 0;
-        uint8_t device_id[32], device_pub[32], client_nonce[32], server_nonce[32], transcript_hash[32];
-        uint8_t A[32], s[32], ack = 0x01;
-        uint8_t *device_cert_buf = NULL, *device_sig = NULL;
-        uint32_t device_cert_len = 0, device_sig_len = 0;
-        X509 *device_cert = NULL;
-        EVP_PKEY *device_cert_pubkey = NULL;
-        int upsert = -1;
-
         memset(token_buf, 0, sizeof token_buf);
         if (recv_pairing_token(cfd, token_buf, &token_len, &recv_bytes) != 0) goto cleanup;
 
@@ -707,99 +642,97 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
             goto cleanup;
         }
 
-        if (recv_all(cfd, device_id, 32, &recv_bytes) != 0) goto cleanup;
-        if (recv_all(cfd, device_pub, 32, &recv_bytes) != 0) goto cleanup;
-        if (recv_all(cfd, client_nonce, 32, &recv_bytes) != 0) goto cleanup;
-        device_cert_buf = recv_blob(cfd, &device_cert_len, MAX_CERT_FILE_SIZE, &recv_bytes);
-        if (!device_cert_buf) {
-            fprintf(stderr, "Server[SETUP/ZTP]: failed to receive device certificate");
+        uint8_t bid_len_byte;
+        if (recv_u8(cfd, &bid_len_byte, &recv_bytes) != 0) goto cleanup;
+        if (bid_len_byte != BOOTSTRAP_ID_LEN) {
+            fprintf(stderr, "Server[SETUP/ZTP]: invalid bootstrap_id length\n");
             goto cleanup;
         }
+
+        uint8_t bootstrap_id[BOOTSTRAP_ID_LEN], bootstrap_secret[BOOTSTRAP_SECRET_LEN];
+        uint8_t device_id[32], device_pub[32], client_nonce[32];
+
+        if (recv_all(cfd, bootstrap_id,  BOOTSTRAP_ID_LEN, &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, device_id,     32,               &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, device_pub,    32,               &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, client_nonce,  32,               &recv_bytes) != 0) goto cleanup;
+
         if (check_point(device_pub, "device_pub") != 0) goto cleanup;
 
-        device_cert = load_cert_from_bytes(device_cert_buf, device_cert_len);
-        if (!device_cert || verify_cert_against_ca(device_cert, ca_cert) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device certificate verification failed");
+        if (bootstrap_lookup(*boot, *boot_n, bootstrap_id, bootstrap_secret) != 0) {
+            fprintf(stderr, "Server[SETUP/ZTP]: unknown bootstrap_id\n");
             goto cleanup;
         }
 
-        bin2hex_lower(device_id, 32, expected_cn, sizeof expected_cn);
-        bin2hex_lower(device_pub, 32, expected_ou, sizeof expected_ou);
-        if (cert_subject_field_hex(device_cert, NID_commonName, cert_cn, sizeof cert_cn) != 0 ||
-            strcmp(cert_cn, expected_cn) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device certificate CN mismatch");
-            goto cleanup;
-        }
-        if (cert_subject_field_hex(device_cert, NID_organizationalUnitName, cert_ou, sizeof cert_ou) != 0 ||
-            strcmp(cert_ou, expected_ou) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device certificate OU mismatch");
+        uint8_t existing_pub[32];
+        int existing = reg_lookup(*reg, *reg_n, device_id, existing_pub);
+        int is_new   = (existing != 0);
+        if (!is_new && sodium_memcmp(existing_pub, device_pub, 32) != 0) {
+            fprintf(stderr, "Server[SETUP/ZTP]: device_id collision\n");
             goto cleanup;
         }
 
-        {
-            uint8_t existing_pub[32];
-            int existing = reg_lookup(*reg, *reg_n, device_id, existing_pub);
-            int is_new = (existing != 0);
-            if (!is_new && sodium_memcmp(existing_pub, device_pub, 32) != 0) {
-                fprintf(stderr, "Server[SETUP/ZTP]: device_id collision");
-                goto cleanup;
-            }
-        }
-
+        uint8_t server_nonce[32];
         randombytes_buf(server_nonce, 32);
-        ztp_cert_transcript_hash(transcript_hash, device_id, device_pub, client_nonce, server_nonce,
-                                 device_cert_buf, device_cert_len, server_cert_buf, (uint32_t)server_cert_len);
-        {
-            uint8_t *server_sig = NULL;
-            size_t server_sig_len = 0;
-            if (sign_transcript_hash(server_cert_key, transcript_hash, &server_sig, &server_sig_len) != 0) {
-                fprintf(stderr, "Server[SETUP/ZTP]: failed to sign setup transcript");
-                goto cleanup;
-            }
-            if (send_all(cfd, server_nonce, 32, &sent) != 0) { free(server_sig); goto cleanup; }
-            if (send_blob(cfd, server_cert_buf, (uint32_t)server_cert_len, &sent) != 0) { free(server_sig); goto cleanup; }
-            if (send_blob(cfd, server_sig, (uint32_t)server_sig_len, &sent) != 0) { free(server_sig); goto cleanup; }
-            sodium_memzero(server_sig, server_sig_len);
-            free(server_sig);
-        }
 
-        if (recv_all(cfd, A, 32, &recv_bytes) != 0) goto cleanup;
-        if (recv_all(cfd, s, 32, &recv_bytes) != 0) goto cleanup;
-        device_sig = recv_blob(cfd, &device_sig_len, MAX_SIG_SIZE, &recv_bytes);
-        if (!device_sig) goto cleanup;
+        if (send_all(cfd, server_pub,   32, &sent) != 0) goto cleanup;
+        if (send_all(cfd, server_nonce, 32, &sent) != 0) goto cleanup;
+
+        uint8_t A[32], s[32], bootstrap_mac[32], expected_mac[32];
+        if (recv_all(cfd, A,             32, &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, s,             32, &recv_bytes) != 0) goto cleanup;
+        if (recv_all(cfd, bootstrap_mac, 32, &recv_bytes) != 0) goto cleanup;
 
         if (check_point(A, "setup_A") != 0) goto cleanup;
+
         if (schnorr_verify_setup(device_id, device_pub, server_nonce, A, s) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: Schnorr proof invalid");
+            fprintf(stderr, "Server[SETUP/ZTP]: Schnorr proof invalid\n");
             goto cleanup;
         }
 
-        device_cert_pubkey = X509_get_pubkey(device_cert);
-        if (!device_cert_pubkey || verify_transcript_hash_sig(device_cert_pubkey, transcript_hash, device_sig, device_sig_len) != 0) {
-            fprintf(stderr, "Server[SETUP/ZTP]: device transcript signature invalid");
+        compute_bootstrap_mac(expected_mac, bootstrap_secret, bootstrap_id, device_id, device_pub,
+                              server_pub, client_nonce, server_nonce);
+
+        if (sodium_memcmp(expected_mac, bootstrap_mac, 32) != 0) {
+            fprintf(stderr, "Server[SETUP/ZTP]: bootstrap MAC invalid\n");
+            sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
+            sodium_memzero(expected_mac, sizeof expected_mac);
             goto cleanup;
         }
 
-        upsert = reg_upsert(reg, reg_n, device_id, device_pub);
+        int upsert = reg_upsert(reg, reg_n, device_id, device_pub);
         if (upsert < 0) {
             fprintf(stderr, "Server[SETUP/ZTP]: registry update failed\n");
+            sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
+            sodium_memzero(expected_mac, sizeof expected_mac);
             goto cleanup;
         }
 
-        {
-            char hex_id[65];
-            sodium_bin2hex(hex_id, sizeof hex_id, device_id, 32);
-            if (upsert == 1)
-                printf("Server[SETUP/ZTP]: enrolled NEW device_id=%s via mutual certificate onboarding\n", hex_id);
-            else
-                printf("Server[SETUP/ZTP]: validated existing device_id=%s via mutual certificate onboarding\n", hex_id);
-        }
+        char hex_id[65], hex_bid[65];
+        sodium_bin2hex(hex_id,  sizeof hex_id,  device_id,    32);
+        sodium_bin2hex(hex_bid, sizeof hex_bid, bootstrap_id, BOOTSTRAP_ID_LEN);
 
+        if (upsert == 1)
+            printf("Server[SETUP/ZTP]: enrolled NEW device_id=%s bootstrap_id=%s\n", hex_id, hex_bid);
+        else
+            printf("Server[SETUP/ZTP]: validated existing device_id=%s bootstrap_id=%s\n", hex_id, hex_bid);
+
+        sodium_memzero(bootstrap_secret, sizeof bootstrap_secret);
+        sodium_memzero(expected_mac, sizeof expected_mac);
+
+        /*
+         * [TOFU-FIX] Send enrollment acknowledgment (0x01).
+         *
+         * This byte is only reached after BOTH the Schnorr proof AND the
+         * bootstrap MAC verified successfully.  The MAC transcript includes
+         * server_pub, so a MITM that substituted a different key would cause
+         * MAC verification to fail above and we would jump to cleanup before
+         * ever reaching this send.  Therefore the client can safely treat
+         * receipt of 0x01 as proof that the server it connected to is the
+         * genuine holder of the server_pub it received.
+         */
+        uint8_t ack = 0x01;
         if (send_all(cfd, &ack, 1, &sent) != 0) goto cleanup;
-        if (device_cert_pubkey) { EVP_PKEY_free(device_cert_pubkey); device_cert_pubkey = NULL; }
-        if (device_cert) { X509_free(device_cert); device_cert = NULL; }
-        if (device_sig) { sodium_memzero(device_sig, device_sig_len); free(device_sig); device_sig = NULL; }
-        free(device_cert_buf); device_cert_buf = NULL;
 
     } else if (msg_type == MSG_AUTH_V2) {
 
@@ -993,6 +926,9 @@ int main(int argc, char **argv) {
     pairing_policy_t policy;
     memset(&policy, 0, sizeof policy);
 
+    uint8_t add_bootstrap_id[BOOTSTRAP_ID_LEN];
+    uint8_t add_bootstrap_secret[BOOTSTRAP_SECRET_LEN];
+    int have_add_bootstrap = 0;
     int print_pubkey = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -1009,12 +945,29 @@ int main(int argc, char **argv) {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             policy.deadline_sec = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9 + secs;
+        } else if (!strcmp(argv[i], "--add-bootstrap") && i + 2 < argc) {
+            size_t bin_len = 0;
+            if (sodium_hex2bin(add_bootstrap_id, sizeof add_bootstrap_id,
+                               argv[i+1], strlen(argv[i+1]), NULL, &bin_len, NULL) != 0 ||
+                bin_len != BOOTSTRAP_ID_LEN) {
+                fprintf(stderr, "invalid bootstrap_id hex\n");
+                return 1;
+            }
+            if (sodium_hex2bin(add_bootstrap_secret, sizeof add_bootstrap_secret,
+                               argv[i+2], strlen(argv[i+2]), NULL, &bin_len, NULL) != 0 ||
+                bin_len != BOOTSTRAP_SECRET_LEN) {
+                fprintf(stderr, "invalid bootstrap_secret hex\n");
+                return 1;
+            }
+            have_add_bootstrap = 1;
+            i += 2;
         } else if (!strcmp(argv[i], "--print-pubkey")) {
             print_pubkey = 1;
         } else {
             fprintf(stderr,
                     "Usage: %s [--bind 0.0.0.0:4000] [--pairing] "
-                    "[--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]\n", argv[0]);
+                    "[--pairing-token TOKEN] [--pairing-seconds N] "
+                    "[--add-bootstrap <id_hex> <secret_hex>] [--print-pubkey]\n", argv[0]);
             return 1;
         }
     }
@@ -1040,57 +993,33 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    size_t server_cert_len = 0, server_key_len = 0, ca_cert_len = 0;
-    uint8_t *server_cert_buf = read_file_all(SERVER_CERT_FILE, &server_cert_len, MAX_CERT_FILE_SIZE);
-    uint8_t *server_key_buf = read_file_all(SERVER_CERT_KEY_FILE, &server_key_len, MAX_CERT_FILE_SIZE);
-    uint8_t *ca_cert_buf = read_file_all(CA_CERT_FILE, &ca_cert_len, MAX_CERT_FILE_SIZE);
-    X509 *server_cert = NULL, *ca_cert = NULL;
-    EVP_PKEY *server_cert_key = NULL;
-    char expected_server_ou[65], cert_server_ou[128];
+    bootstrap_entry_t *boot = NULL;
+    size_t boot_n = 0;
+    if (load_bootstrap_db(&boot, &boot_n) != 0) {
+        fprintf(stderr, "Failed to load bootstrap DB\n");
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
+    }
 
-    if (!server_cert_buf || !server_key_buf || !ca_cert_buf) {
-        fprintf(stderr, "Missing server_cert.pem, server_cert_key.pem, or ca_cert.pem\n");
+    if (have_add_bootstrap) {
+        if (bootstrap_upsert(&boot, &boot_n, add_bootstrap_id, add_bootstrap_secret) < 0) {
+            fprintf(stderr, "Failed to update bootstrap DB\n");
+            free(boot);
+            sodium_memzero(server_sk, sizeof server_sk);
+            return 1;
+        }
+        char hex_bid[65];
+        sodium_bin2hex(hex_bid, sizeof hex_bid, add_bootstrap_id, BOOTSTRAP_ID_LEN);
+        printf("Server: added bootstrap_id=%s to %s\n", hex_bid, BOOTSTRAP_DB_FILE);
+        sodium_memzero(add_bootstrap_secret, sizeof add_bootstrap_secret);
+        free(boot);
         sodium_memzero(server_sk, sizeof server_sk);
-        free(server_cert_buf); free(server_key_buf); free(ca_cert_buf);
-        return 1;
+        return 0;
     }
-    server_cert = load_cert_from_bytes(server_cert_buf, server_cert_len);
-    ca_cert = load_cert_from_bytes(ca_cert_buf, ca_cert_len);
-    server_cert_key = load_private_key_from_bytes(server_key_buf, server_key_len);
-    if (!server_cert || !ca_cert || !server_cert_key) {
-        fprintf(stderr, "Failed to parse server certificate material\n");
-        sodium_memzero(server_sk, sizeof server_sk);
-        free(server_cert_buf); free(server_key_buf); free(ca_cert_buf);
-        if (server_cert) X509_free(server_cert);
-        if (ca_cert) X509_free(ca_cert);
-        if (server_cert_key) EVP_PKEY_free(server_cert_key);
-        return 1;
-    }
-    if (verify_cert_against_ca(server_cert, ca_cert) != 0) {
-        fprintf(stderr, "Server certificate not issued by trusted CA\n");
-        sodium_memzero(server_sk, sizeof server_sk);
-        free(server_cert_buf); free(server_key_buf); free(ca_cert_buf);
-        X509_free(server_cert); X509_free(ca_cert); EVP_PKEY_free(server_cert_key);
-        return 1;
-    }
-    bin2hex_lower(server_pub, 32, expected_server_ou, sizeof expected_server_ou);
-    if (cert_subject_field_hex(server_cert, NID_organizationalUnitName, cert_server_ou, sizeof cert_server_ou) != 0 || strcmp(cert_server_ou, expected_server_ou) != 0) {
-        fprintf(stderr, "Server certificate OU does not match server_pub\n");
-        sodium_memzero(server_sk, sizeof server_sk);
-        free(server_cert_buf); free(server_key_buf); free(ca_cert_buf);
-        X509_free(server_cert); X509_free(ca_cert); EVP_PKEY_free(server_cert_key);
-        return 1;
-    }
-    sodium_memzero(server_key_buf, server_key_len);
-    free(server_key_buf);
-    free(ca_cert_buf);
 
     if (replay_init() != 0) {
         fprintf(stderr, "Failed to initialise replay cache\n");
-        free(server_cert_buf);
-        X509_free(server_cert);
-        X509_free(ca_cert);
-        EVP_PKEY_free(server_cert_key);
+        free(boot);
         sodium_memzero(server_sk, sizeof server_sk);
         return 1;
     }
@@ -1099,10 +1028,7 @@ int main(int argc, char **argv) {
     uint16_t port;
     if (parse_bind(bind_str, ip, &port) != 0) {
         fprintf(stderr, "bad --bind value\n");
-        free(server_cert_buf);
-        X509_free(server_cert);
-        X509_free(ca_cert);
-        EVP_PKEY_free(server_cert_key);
+        free(boot);
         sodium_memzero(server_sk, sizeof server_sk);
         return 1;
     }
@@ -1111,10 +1037,7 @@ int main(int argc, char **argv) {
     size_t reg_n = 0;
     if (load_registry(&reg, &reg_n) != 0) {
         fprintf(stderr, "Failed to load registry\n");
-        free(server_cert_buf);
-        X509_free(server_cert);
-        X509_free(ca_cert);
-        EVP_PKEY_free(server_cert_key);
+        free(boot);
         sodium_memzero(server_sk, sizeof server_sk);
         return 1;
     }
@@ -1123,10 +1046,7 @@ int main(int argc, char **argv) {
     if (lfd < 0) {
         fprintf(stderr, "listen failed\n");
         free(reg);
-        free(server_cert_buf);
-        X509_free(server_cert);
-        X509_free(ca_cert);
-        EVP_PKEY_free(server_cert_key);
+        free(boot);
         sodium_memzero(server_sk, sizeof server_sk);
         return 1;
     }
@@ -1136,10 +1056,11 @@ int main(int argc, char **argv) {
 
     printf("C Server listening on %s\n", bind_str);
     printf("Server public key (pin this on client): %s\n", hex_pub);
-    printf("Server: pairing_enabled=%s token_configured=%s deadline=%s mutual_cert_onboarding=true\n",
+    printf("Server: pairing_enabled=%s token_configured=%s deadline=%s bootstrap_db_entries=%zu\n",
            policy.enabled          ? "true" : "false",
            policy.token_configured ? "true" : "false",
-           policy.deadline_sec > 0.0 ? "set" : "none");
+           policy.deadline_sec > 0.0 ? "set" : "none",
+           boot_n);
 
     for (;;) {
         struct sockaddr_in peer_addr;
@@ -1153,6 +1074,6 @@ int main(int argc, char **argv) {
         char peer_str[64];
         snprintf(peer_str, sizeof peer_str, "%s:%d", peer_ip, ntohs(peer_addr.sin_port));
 
-        handle_client(cfd, peer_str, &reg, &reg_n, server_sk, server_pub, &policy, server_cert_buf, server_cert_len, server_cert_key, server_cert, ca_cert);
+        handle_client(cfd, peer_str, &reg, &reg_n, &boot, &boot_n, server_sk, server_pub, &policy);
     }
 }
