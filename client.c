@@ -22,6 +22,7 @@
 #define MSG_AUTH_V2  0x03
 
 #define STATE_DIR              "/var/lib/iot-auth"
+#define CLIENT_STATE_DIR       "/var/lib/iot-auth/client"
 #define DEVICE_ROOT_FILE       "/var/lib/iot-auth/client/device_root.bin"
 #define SERVER_PUB_FILE        "/var/lib/iot-auth/client/server_pub.bin"
 #define DEVICE_CERT_FILE       "/var/lib/iot-auth/client/device_cert.pem"
@@ -51,14 +52,25 @@ static void nonce_next(nonce_ctr_t *c, uint8_t out[12]) {
 // Checks whether the given file path exists.
 static int file_exists(const char *path) { return access(path, F_OK) == 0; }
 
-// Creates the client state directory if it does not already exist.
+// Creates the client state directory tree if it does not already exist.
 static int ensure_state_dir(void) {
     struct stat st;
+
     if (stat(STATE_DIR, &st) == 0) {
         if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
-        return 0;
+    } else if (mkdir(STATE_DIR, 0700) != 0 && errno != EEXIST) {
+        return -1;
     }
-    return (mkdir(STATE_DIR, 0700) == 0) ? 0 : -1;
+
+    if (stat(CLIENT_STATE_DIR, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+    } else if (mkdir(CLIENT_STATE_DIR, 0700) != 0 && errno != EEXIST) {
+        return -1;
+    }
+
+    if (chmod(STATE_DIR, 0700) != 0) return -1;
+    if (chmod(CLIENT_STATE_DIR, 0700) != 0) return -1;
+    return 0;
 }
 
 // Reads exactly 32 bytes from a file into the provided buffer.

@@ -8,6 +8,8 @@
 #include <time.h>
 #include <sys/time.h> 
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <pthread.h>       /* FIX: per-connection threads */
 #include <openssl/pem.h>
@@ -30,6 +32,13 @@
 #define REPLAY_GEN_MAX  25000
 #define MAX_CERT_FILE_SIZE (128 * 1024)
 #define MAX_SIG_SIZE 8192
+#define CERT_MAX_VALIDITY_DAYS 30
+#define MAX_ACTIVE_CONNECTIONS 64
+#define FAIL_WINDOW_SEC 60.0
+#define BLOCK_WINDOW_SEC 120.0
+#define MAX_FAILURES 5
+#define REPLAY_SAVE_INTERVAL_SEC 2.0
+#define REPLAY_SAVE_BATCH 64
 
 /* FIX: recv timeout applied to every accepted socket to prevent slow-loris DoS */
 #define RECV_TIMEOUT_SEC 10
@@ -57,6 +66,145 @@ typedef struct {
     char   token[128];
     double deadline_sec;
 } pairing_policy_t;
+
+typedef struct {
+    char peer[64];
+    unsigned failures;
+    double first_failure_sec;
+    double blocked_until_sec;
+} failure_entry_t;
+
+static pthread_mutex_t g_rate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_conn_mutex = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_active_connections = 0;
+static failure_entry_t g_failures[256];
+static size_t g_failure_n = 0;
+
+static double get_time_sec(void);
+static int replay_maybe_flush_locked(int force);
+
+static int require_private_file_mode(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+    if ((st.st_mode & 077) != 0) { errno = EACCES; return -1; }
+    return 0;
+}
+
+static int require_cert_file_mode(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+    if ((st.st_mode & 022) != 0) { errno = EACCES; return -1; }
+    return 0;
+}
+
+static int cert_validity_days(X509 *cert) {
+    int pday = 0, psec = 0;
+    int ndays = 0;
+    if (!X509_get0_notBefore(cert) || !X509_get0_notAfter(cert)) return -1;
+    if (ASN1_TIME_diff(&pday, &psec, X509_get0_notBefore(cert), X509_get0_notAfter(cert)) != 1) return -1;
+    if (pday < 0 || psec < 0) return -1;
+    ndays = pday;
+    if (psec > 0) ndays += 1;
+    return ndays;
+}
+
+static int cert_has_expected_eku(X509 *cert, int expected_nid) {
+    STACK_OF(ASN1_OBJECT) *eku = X509_get_ext_d2i(cert, NID_ext_key_usage, NULL, NULL);
+    if (!eku) return 0;
+
+    int found = 0;
+    for (int i = 0; i < sk_ASN1_OBJECT_num(eku); i++) {
+        ASN1_OBJECT *obj = sk_ASN1_OBJECT_value(eku, i);
+        if (obj != NULL && OBJ_obj2nid(obj) == expected_nid) {
+            found = 1;
+            break;
+        }
+    }
+
+    sk_ASN1_OBJECT_pop_free(eku, ASN1_OBJECT_free);
+    return found;
+}
+
+static int cert_has_custom_oid(X509 *cert, const char *oid_txt) {
+    ASN1_OBJECT *obj = OBJ_txt2obj(oid_txt, 1);
+    int idx;
+    if (!obj) return -1;
+    idx = X509_get_ext_by_OBJ(cert, obj, -1);
+    ASN1_OBJECT_free(obj);
+    return (idx >= 0) ? 0 : -1;
+}
+
+static int rate_limit_should_block(const char *peer) {
+    double now = get_time_sec();
+    int blocked = 0;
+    pthread_mutex_lock(&g_rate_mutex);
+    for (size_t i = 0; i < g_failure_n; i++) {
+        if (strcmp(g_failures[i].peer, peer) == 0) {
+            if (g_failures[i].blocked_until_sec > now) blocked = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_rate_mutex);
+    return blocked ? -1 : 0;
+}
+
+static void rate_limit_record_failure(const char *peer) {
+    double now = get_time_sec();
+    pthread_mutex_lock(&g_rate_mutex);
+    failure_entry_t *e = NULL;
+    for (size_t i = 0; i < g_failure_n; i++) {
+        if (strcmp(g_failures[i].peer, peer) == 0) { e = &g_failures[i]; break; }
+    }
+    if (!e && g_failure_n < (sizeof g_failures / sizeof g_failures[0])) {
+        e = &g_failures[g_failure_n++];
+        memset(e, 0, sizeof *e);
+        snprintf(e->peer, sizeof e->peer, "%s", peer);
+    }
+    if (e) {
+        if (e->first_failure_sec == 0.0 || (now - e->first_failure_sec) > FAIL_WINDOW_SEC) {
+            e->first_failure_sec = now;
+            e->failures = 1;
+        } else {
+            e->failures++;
+        }
+        if (e->failures >= MAX_FAILURES) {
+            e->blocked_until_sec = now + BLOCK_WINDOW_SEC;
+            e->failures = 0;
+            e->first_failure_sec = now;
+        }
+    }
+    pthread_mutex_unlock(&g_rate_mutex);
+}
+
+static void rate_limit_record_success(const char *peer) {
+    pthread_mutex_lock(&g_rate_mutex);
+    for (size_t i = 0; i < g_failure_n; i++) {
+        if (strcmp(g_failures[i].peer, peer) == 0) {
+            memset(&g_failures[i], 0, sizeof g_failures[i]);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_rate_mutex);
+}
+
+static int try_acquire_connection_slot(void) {
+    int ok = 0;
+    pthread_mutex_lock(&g_conn_mutex);
+    if (g_active_connections < MAX_ACTIVE_CONNECTIONS) {
+        g_active_connections++;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_conn_mutex);
+    return ok ? 0 : -1;
+}
+
+static void release_connection_slot(void) {
+    pthread_mutex_lock(&g_conn_mutex);
+    if (g_active_connections > 0) g_active_connections--;
+    pthread_mutex_unlock(&g_conn_mutex);
+}
 
 // Checks whether zero-touch setup is currently allowed under the pairing policy.
 static int allows_ztp_setup(const pairing_policy_t *pol,
@@ -87,6 +235,7 @@ static int file_exists(const char *path) { return access(path, F_OK) == 0; }
 
 // Reads exactly 32 bytes from a file into the provided buffer.
 static int read_file_32(const char *path, uint8_t out[32]) {
+    if (require_private_file_mode(path) != 0) return -1;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     size_t n = fread(out, 1, 32, f);
@@ -199,6 +348,9 @@ static replay_key_t *replay_curr  = NULL;
 static replay_key_t *replay_prev  = NULL;
 static size_t        replay_curr_n = 0;
 static size_t        replay_prev_n = 0;
+static int           replay_dirty = 0;
+static size_t        replay_dirty_ops = 0;
+static double        replay_last_save_sec = 0.0;
 /* FIX: replay cache access is also covered by g_reg_mutex to avoid races */
 
 static int replay_save_locked(void) {
@@ -226,6 +378,28 @@ static int replay_save_locked(void) {
     fclose(f);
     if (chmod(REPLAY_CACHE_FILE ".tmp", 0600) != 0) return -1;
     return rename(REPLAY_CACHE_FILE ".tmp", REPLAY_CACHE_FILE);
+}
+
+static int replay_maybe_flush_locked(int force) {
+    double now = get_time_sec();
+
+    if (!replay_dirty) return 0;
+
+    if (!force) {
+        if (replay_dirty_ops < REPLAY_SAVE_BATCH &&
+            (now - replay_last_save_sec) < REPLAY_SAVE_INTERVAL_SEC) {
+            return 0;
+        }
+    }
+
+    if (replay_save_locked() != 0) {
+        return -1;
+    }
+
+    replay_dirty = 0;
+    replay_dirty_ops = 0;
+    replay_last_save_sec = now;
+    return 0;
 }
 
 static int replay_load_into_memory(void) {
@@ -267,11 +441,16 @@ static int replay_init(void) {
     replay_curr = malloc(sizeof(replay_key_t) * REPLAY_GEN_MAX);
     replay_prev = malloc(sizeof(replay_key_t) * REPLAY_GEN_MAX);
     if (!replay_curr || !replay_prev) {
-        free(replay_curr); free(replay_prev);
+        free(replay_curr);
+        free(replay_prev);
         replay_curr = replay_prev = NULL;
         return -1;
     }
-    replay_curr_n = replay_prev_n = 0;
+    replay_curr_n = 0;
+    replay_prev_n = 0;
+    replay_dirty = 0;
+    replay_dirty_ops = 0;
+    replay_last_save_sec = get_time_sec();
     return replay_load_into_memory();
 }
 
@@ -301,7 +480,9 @@ static int check_and_insert_replay(const uint8_t device_id[32],
     }
 
     memcpy(replay_curr[replay_curr_n++].key, k, 64);
-    return replay_save_locked();
+    replay_dirty = 1;
+    replay_dirty_ops++;
+    return replay_maybe_flush_locked(0);
 }
 
 // Sends the full buffer over the socket, retrying until complete or failed.
@@ -703,6 +884,24 @@ static int verify_cert_against_ca(X509 *cert, X509 *ca_cert) {
     return ok;
 }
 
+// Validates CA chaining and local leaf-certificate policy.
+static int verify_cert_against_ca_with_policy(X509 *cert, X509 *ca_cert, int is_server_cert) {
+    int expected_eku_nid = is_server_cert ? NID_server_auth : NID_client_auth;
+    const char *id_oid = is_server_cert ? "1.3.6.1.4.1.55555.1.2"
+                                        : "1.3.6.1.4.1.55555.1.1";
+    int days;
+
+    if (verify_cert_against_ca(cert, ca_cert) != 0) return -1;
+
+    days = cert_validity_days(cert);
+    if (days < 0 || days > CERT_MAX_VALIDITY_DAYS) return -1;
+
+    if (!cert_has_expected_eku(cert, expected_eku_nid)) return -1;
+    if (cert_has_custom_oid(cert, id_oid) != 0) return -1;
+
+    return 0;
+}
+
 // Reads a certificate subject field and normalizes it to lowercase hex text.
 static int cert_subject_field_hex(X509 *cert, int nid, char *out, size_t out_len) {
     X509_NAME *name = X509_get_subject_name(cert);
@@ -804,8 +1003,12 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
                           EVP_PKEY *server_cert_key, X509 *server_cert, X509 *ca_cert) {
     double start_time = get_time_sec();
     size_t sent = 0, recv_bytes = 0;
+    int success = 0;
+
+    (void)server_cert;
 
     uint8_t msg_type;
+    if (rate_limit_should_block(peer) != 0) goto cleanup;
     if (recv_u8(cfd, &msg_type, &recv_bytes) != 0) goto cleanup;
 
     if (msg_type == MSG_SETUP) {
@@ -840,7 +1043,7 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         if (check_point(device_pub, "device_pub") != 0) goto cleanup;
 
         device_cert = load_cert_from_bytes(device_cert_buf, device_cert_len);
-        if (!device_cert || verify_cert_against_ca(device_cert, ca_cert) != 0) {
+        if (!device_cert || verify_cert_against_ca_with_policy(device_cert, ca_cert, 0) != 0) {
             fprintf(stderr, "Server[SETUP/ZTP]: device certificate verification failed");
             goto cleanup;
         }
@@ -924,6 +1127,8 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         }
 
         if (send_all(cfd, &ack, 1, &sent) != 0) goto cleanup;
+        rate_limit_record_success(peer);
+        success = 1;
         if (device_cert_pubkey) { EVP_PKEY_free(device_cert_pubkey); device_cert_pubkey = NULL; }
         if (device_cert) { X509_free(device_cert); device_cert = NULL; }
         if (device_sig) { sodium_memzero(device_sig, device_sig_len); free(device_sig); device_sig = NULL; }
@@ -1092,6 +1297,8 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         char hex_id[65];
         sodium_bin2hex(hex_id, sizeof hex_id, device_id, 32);
         printf("Server[AUTH]: device_id=%s KC=OK\n", hex_id);
+        rate_limit_record_success(peer);
+        success = 1;
 
         sodium_memzero(eph_s_secret,  sizeof eph_s_secret);
         sodium_memzero(session_key,   sizeof session_key);
@@ -1107,6 +1314,10 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
     }
 
 cleanup:
+    pthread_mutex_lock(&g_reg_mutex);
+    replay_maybe_flush_locked(0);
+    pthread_mutex_unlock(&g_reg_mutex);
+    if (!success) rate_limit_record_failure(peer);
     close(cfd);
     double dur = get_time_sec() - start_time;
     printf("SERVER METRICS -> %s Duration: %.3fms, Sent: %zu bytes, Received: %zu bytes\n",
@@ -1146,6 +1357,7 @@ static void *client_thread_func(void *arg) {
                   a->server_cert_buf, a->server_cert_len,
                   a->server_cert_key, a->server_cert, a->ca_cert);
     sodium_memzero(a->server_sk, sizeof a->server_sk);
+    release_connection_slot();
     free(a);
     return NULL;
 }
@@ -1205,6 +1417,12 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (require_cert_file_mode(SERVER_CERT_FILE) != 0 || require_private_file_mode(SERVER_CERT_KEY_FILE) != 0 || require_cert_file_mode(CA_CERT_FILE) != 0 || require_private_file_mode(SERVER_SK_FILE) != 0) {
+        fprintf(stderr, "Insecure server file permissions\n");
+        sodium_memzero(server_sk, sizeof server_sk);
+        return 1;
+    }
+
     size_t server_cert_len = 0, server_key_len = 0, ca_cert_len = 0;
     uint8_t *server_cert_buf = read_file_all(SERVER_CERT_FILE, &server_cert_len, MAX_CERT_FILE_SIZE);
     uint8_t *server_key_buf = read_file_all(SERVER_CERT_KEY_FILE, &server_key_len, MAX_CERT_FILE_SIZE);
@@ -1231,7 +1449,7 @@ int main(int argc, char **argv) {
         if (server_cert_key) EVP_PKEY_free(server_cert_key);
         return 1;
     }
-    if (verify_cert_against_ca(server_cert, ca_cert) != 0) {
+    if (verify_cert_against_ca_with_policy(server_cert, ca_cert, 1) != 0) {
         fprintf(stderr, "Server certificate not issued by trusted CA\n");
         sodium_memzero(server_sk, sizeof server_sk);
         free(server_cert_buf); free(server_key_buf); free(ca_cert_buf);
@@ -1311,6 +1529,7 @@ int main(int argc, char **argv) {
         socklen_t peer_len = sizeof peer_addr;
         int cfd = accept(lfd, (struct sockaddr *)&peer_addr, &peer_len);
         if (cfd < 0) continue;
+        if (try_acquire_connection_slot() != 0) { close(cfd); continue; }
 
         /* FIX: apply recv timeout immediately so slow/stalled clients cannot
            block a thread indefinitely (slow-loris style). */
@@ -1348,6 +1567,7 @@ int main(int argc, char **argv) {
         if (pthread_create(&tid, &attr, client_thread_func, args) != 0) {
             sodium_memzero(args->server_sk, sizeof args->server_sk);
             free(args);
+            release_connection_slot();
             close(cfd);
         }
         pthread_attr_destroy(&attr);
