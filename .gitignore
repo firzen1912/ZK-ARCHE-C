@@ -53,3 +53,5 @@ Module.symvers
 Mkfile.old
 dkms.conf
 last_bootstrap.env
+c_server
+c_client
