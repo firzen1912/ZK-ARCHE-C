@@ -25,12 +25,8 @@
 #define CLIENT_STATE_DIR       "/var/lib/iot-auth/client"
 #define DEVICE_ROOT_FILE       "/var/lib/iot-auth/client/device_root.bin"
 #define SERVER_PUB_FILE        "/var/lib/iot-auth/client/server_pub.bin"
-#define DEVICE_CERT_FILE       "/var/lib/iot-auth/client/device_cert.pem"
-#define DEVICE_KEY_FILE        "/var/lib/iot-auth/client/device_key.pem"
-#define CA_CERT_FILE           "/var/lib/iot-auth/client/ca_cert.pem"
+#define PROVISION_PSK_FILE     "/var/lib/iot-auth/client/provision_psk.bin"
 #define MAX_ENCRYPTED_PAYLOAD  4096
-#define MAX_CERT_FILE_SIZE     (128 * 1024)
-#define MAX_SIG_SIZE           8192
 
 typedef struct { uint64_t count; } nonce_ctr_t;
 #define NONCE_CTR_INIT { 0 }
@@ -222,23 +218,20 @@ static void tr_challenge_scalar(uint8_t c_out[32], const transcript_t *tr) {
     crypto_core_ristretto255_scalar_reduce(c_out, h);
 }
 
-// Builds the mutual-certificate onboarding transcript hash.
-static void ztp_cert_transcript_hash(uint8_t out[32],
-                                   const uint8_t device_id[32], const uint8_t device_pub[32],
-                                   const uint8_t client_nonce[32], const uint8_t server_nonce[32],
-                                   const uint8_t *device_cert, uint32_t device_cert_len,
-                                   const uint8_t *server_cert, uint32_t server_cert_len) {
-    uint8_t dev_hash[32], srv_hash[32];
+// Builds the per-device PSK onboarding transcript hash.
+static void ztp_psk_transcript_hash(uint8_t out[32],
+                                    const uint8_t device_id[32], const uint8_t device_pub[32],
+                                    const uint8_t client_nonce[32], const uint8_t server_nonce[32],
+                                    const uint8_t server_pub[32],
+                                    const uint8_t *pairing_token, uint32_t pairing_token_len) {
     transcript_t tr;
-    crypto_hash_sha256(dev_hash, device_cert, device_cert_len);
-    crypto_hash_sha256(srv_hash, server_cert, server_cert_len);
-    tr_init(&tr, "ztp-mutual-cert-v1");
+    tr_init(&tr, "ztp-psk-v1");
     tr_append(&tr, "device_id", device_id, 32);
     tr_append(&tr, "device_pub", device_pub, 32);
     tr_append(&tr, "client_nonce", client_nonce, 32);
     tr_append(&tr, "server_nonce", server_nonce, 32);
-    tr_append(&tr, "device_cert_hash", dev_hash, 32);
-    tr_append(&tr, "server_cert_hash", srv_hash, 32);
+    tr_append(&tr, "server_pub", server_pub, 32);
+    tr_append(&tr, "pairing_token", pairing_token, pairing_token_len);
     crypto_hash_sha256(out, tr.buf, (unsigned long long)tr.len);
 }
 
@@ -666,65 +659,31 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
                     const char *pairing_token, int allow_tofu_setup) {
     double start_time = get_time_sec();
     size_t sent = 0, recv = 0;
-    size_t device_cert_len = 0, device_key_len = 0, ca_cert_len = 0;
-    uint8_t *device_cert_buf = NULL, *device_key_buf = NULL, *ca_cert_buf = NULL;
-    X509 *device_cert = NULL, *ca_cert = NULL, *server_cert = NULL;
-    EVP_PKEY *device_key = NULL, *server_pubkey = NULL;
-    uint8_t server_nonce[32], device_pub[32], client_nonce[32], server_pub[32], transcript_hash[32];
+    uint8_t provision_psk[32], server_nonce[32], device_pub[32], client_nonce[32], server_pub[32], transcript_hash[32];
     uint8_t A[32], s[32], ack = 0;
-    uint8_t *server_cert_buf = NULL, *server_sig = NULL, *device_sig = NULL;
-    uint32_t server_cert_len = 0, server_sig_len = 0;
-    size_t device_sig_len = 0;
+    uint8_t server_tag[32], client_tag[32];
     int fd = -1;
     int rc = -1;
     int have_pinned = 0;
     uint8_t pinned_server_pub[32];
-    char expected_cn[65], expected_ou[65], server_ou[128];
 
-    device_cert_buf = read_file_all(DEVICE_CERT_FILE, &device_cert_len, MAX_CERT_FILE_SIZE);
-    device_key_buf  = read_file_all(DEVICE_KEY_FILE, &device_key_len, MAX_CERT_FILE_SIZE);
-    ca_cert_buf     = read_file_all(CA_CERT_FILE, &ca_cert_len, MAX_CERT_FILE_SIZE);
-    if (!device_cert_buf || !device_key_buf || !ca_cert_buf) {
-        fprintf(stderr, "Client[SETUP/ZTP]: missing device_cert.pem, device_key.pem, or ca_cert.pem\n");
-        goto cleanup;
-    }
-
-    device_cert = load_cert_from_bytes(device_cert_buf, device_cert_len);
-    ca_cert     = load_cert_from_bytes(ca_cert_buf, ca_cert_len);
-    device_key  = load_private_key_from_bytes(device_key_buf, device_key_len);
-    if (!device_cert || !ca_cert || !device_key) {
-        fprintf(stderr, "Client[SETUP/ZTP]: failed to parse certificate material\n");
-        goto cleanup;
-    }
-    if (verify_cert_against_ca(device_cert, ca_cert) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: device certificate not issued by trusted CA\n");
+    if (read_file_32(PROVISION_PSK_FILE, provision_psk) != 0) {
+        fprintf(stderr, "Client[SETUP/PSK]: missing provision_psk.bin\n");
         goto cleanup;
     }
 
     crypto_scalarmult_ristretto255_base(device_pub, x);
-    bin2hex_lower(device_id, 32, expected_cn, sizeof expected_cn);
-    bin2hex_lower(device_pub, 32, expected_ou, sizeof expected_ou);
-    if (cert_subject_field_hex(device_cert, NID_commonName, server_ou, sizeof server_ou) != 0 ||
-        sodium_memcmp(server_ou, expected_cn, strlen(expected_cn)) != 0 || server_ou[strlen(expected_cn)] != '\0') {
-        fprintf(stderr, "Client[SETUP/ZTP]: device certificate CN does not match device_id\n");
-        goto cleanup;
-    }
-    if (cert_subject_field_hex(device_cert, NID_organizationalUnitName, server_ou, sizeof server_ou) != 0 ||
-        sodium_memcmp(server_ou, expected_ou, strlen(expected_ou)) != 0 || server_ou[strlen(expected_ou)] != '\0') {
-        fprintf(stderr, "Client[SETUP/ZTP]: device certificate OU does not match device_pub\n");
-        goto cleanup;
-    }
 
     have_pinned = (read_file_32(SERVER_PUB_FILE, pinned_server_pub) == 0);
     if (!have_pinned && !allow_tofu_setup) {
         fprintf(stderr,
-                "Client[SETUP/ZTP]: first-time setup requires an out-of-band pinned server key. "
+                "Client[SETUP/PSK]: first-time setup requires an out-of-band pinned server key. "
                 "Run --pin-server-pub <hex> first, or pass --allow-tofu-setup for lab use.\n");
         goto cleanup;
     }
     fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); goto cleanup; }
-    printf("Client[SETUP/ZTP]: Connected to %s\n", server);
+    printf("Client[SETUP/PSK]: Connected to %s\n", server);
 
     randombytes_buf(client_nonce, 32);
 
@@ -752,78 +711,58 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
     if (send_all(fd, device_id, 32, &sent) != 0) goto cleanup;
     if (send_all(fd, device_pub, 32, &sent) != 0) goto cleanup;
     if (send_all(fd, client_nonce, 32, &sent) != 0) goto cleanup;
-    if (send_blob(fd, device_cert_buf, (uint32_t)device_cert_len, &sent) != 0) goto cleanup;
 
     if (recv_all(fd, server_nonce, 32, &recv) != 0) goto cleanup;
-    server_cert_buf = recv_blob(fd, &server_cert_len, MAX_CERT_FILE_SIZE, &recv);
-    server_sig      = recv_blob(fd, &server_sig_len, MAX_SIG_SIZE, &recv);
-    if (!server_cert_buf || !server_sig) {
-        fprintf(stderr, "Client[SETUP/ZTP]: failed receiving server certificate/signature\n");
-        goto cleanup;
-    }
+    if (recv_all(fd, server_pub, 32, &recv) != 0) goto cleanup;
+    if (recv_all(fd, server_tag, 32, &recv) != 0) goto cleanup;
 
-    server_cert = load_cert_from_bytes(server_cert_buf, server_cert_len);
-    if (!server_cert || verify_cert_against_ca(server_cert, ca_cert) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: server certificate verification failed\n");
-        goto cleanup;
-    }
-
-    if (cert_subject_field_hex(server_cert, NID_organizationalUnitName, server_ou, sizeof server_ou) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: server certificate missing OU binding\n");
-        goto cleanup;
-    }
-    if (sodium_hex2bin(server_pub, sizeof server_pub, server_ou, strlen(server_ou), NULL, NULL, NULL) != 0 ||
-        check_point(server_pub, "server_pub(cert)") != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: server certificate OU is not a valid Ristretto pubkey hex\n");
-        goto cleanup;
-    }
+    if (check_point(server_pub, "server_pub") != 0) goto cleanup;
     if (have_pinned && sodium_memcmp(pinned_server_pub, server_pub, 32) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: server cert bound pubkey mismatches pinned server_pub.bin\n");
+        fprintf(stderr, "Client[SETUP/PSK]: server pubkey mismatches pinned server_pub.bin\n");
         goto cleanup;
     }
 
-    ztp_cert_transcript_hash(transcript_hash, device_id, device_pub, client_nonce, server_nonce,
-                             device_cert_buf, (uint32_t)device_cert_len, server_cert_buf, server_cert_len);
-    server_pubkey = X509_get_pubkey(server_cert);
-    if (!server_pubkey || verify_transcript_hash_sig(server_pubkey, transcript_hash, server_sig, server_sig_len) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: server transcript signature invalid\n");
+    ztp_psk_transcript_hash(transcript_hash, device_id, device_pub, client_nonce, server_nonce,
+                            server_pub, pairing_token ? (const uint8_t *)pairing_token : (const uint8_t *)"",
+                            pairing_token ? (uint32_t)strlen(pairing_token) : 0);
+    hmac_tag(client_tag, provision_psk, "server setup", transcript_hash);
+    if (sodium_memcmp(client_tag, server_tag, 32) != 0) {
+        fprintf(stderr, "Client[SETUP/PSK]: server PSK tag invalid\n");
         goto cleanup;
     }
 
     schnorr_prove_setup(A, s, x, device_id, device_pub, server_nonce);
-    if (sign_transcript_hash(device_key, transcript_hash, &device_sig, &device_sig_len) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: failed to sign setup transcript\n");
-        goto cleanup;
-    }
+    hmac_tag(client_tag, provision_psk, "client setup", transcript_hash);
 
     if (send_all(fd, A, 32, &sent) != 0) goto cleanup;
     if (send_all(fd, s, 32, &sent) != 0) goto cleanup;
-    if (send_blob(fd, device_sig, (uint32_t)device_sig_len, &sent) != 0) goto cleanup;
+    if (send_all(fd, client_tag, 32, &sent) != 0) goto cleanup;
 
     if (recv_all(fd, &ack, 1, &recv) != 0 || ack != 0x01) {
-        fprintf(stderr, "Client[SETUP/ZTP]: enrollment failed (missing/invalid ack)\n");
+        fprintf(stderr, "Client[SETUP/PSK]: enrollment failed (missing/invalid ack)\n");
         goto cleanup;
     }
 
     if (write_file_32(SERVER_PUB_FILE, server_pub) != 0) {
-        fprintf(stderr, "Client[SETUP/ZTP]: failed to persist server_pub.bin for AUTH_V2\n");
+        fprintf(stderr, "Client[SETUP/PSK]: failed to persist server_pub.bin for AUTH_V2\n");
         goto cleanup;
     }
 
     {
         char hex_pub[65];
         bin2hex_lower(server_pub, 32, hex_pub, sizeof hex_pub);
-        printf("Client[SETUP/ZTP]: Server certificate verified. Saved server_pub for AUTH_V2: %s\n", hex_pub);
+        printf("Client[SETUP/PSK]: Server verified. Saved server_pub for AUTH_V2: %s\n", hex_pub);
     }
 
     {
         double duration = get_time_sec() - start_time;
-        printf("Client[SETUP/ZTP]: Sent=%zu bytes, Received=%zu bytes. Enrolled with mutual cert onboarding.\n", sent, recv);
+        printf("Client[SETUP/PSK]: Sent=%zu bytes, Received=%zu bytes. Enrolled with per-device PSK onboarding.\n", sent, recv);
         printf("CLIENT METRICS -> Duration: %.3fms\n", duration * 1000.0);
     }
     rc = 0;
 
 cleanup:
+    sodium_memzero(provision_psk, sizeof provision_psk);
     sodium_memzero(server_nonce, sizeof server_nonce);
     sodium_memzero(device_pub, sizeof device_pub);
     sodium_memzero(client_nonce, sizeof client_nonce);
@@ -831,19 +770,10 @@ cleanup:
     sodium_memzero(transcript_hash, sizeof transcript_hash);
     sodium_memzero(A, sizeof A);
     sodium_memzero(s, sizeof s);
+    sodium_memzero(server_tag, sizeof server_tag);
+    sodium_memzero(client_tag, sizeof client_tag);
     sodium_memzero(pinned_server_pub, sizeof pinned_server_pub);
     if (fd >= 0) close(fd);
-    if (device_sig) { sodium_memzero(device_sig, device_sig_len); free(device_sig); }
-    if (device_key_buf) { sodium_memzero(device_key_buf, device_key_len); free(device_key_buf); }
-    if (server_pubkey) EVP_PKEY_free(server_pubkey);
-    if (device_key) EVP_PKEY_free(device_key);
-    if (device_cert) X509_free(device_cert);
-    if (ca_cert) X509_free(ca_cert);
-    if (server_cert) X509_free(server_cert);
-    free(device_cert_buf);
-    free(ca_cert_buf);
-    free(server_cert_buf);
-    free(server_sig);
     return rc;
 }
 
