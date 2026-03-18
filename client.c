@@ -651,7 +651,7 @@ static void hmac_tag(uint8_t out[32], const uint8_t key[32], const char *label, 
 // SETUP — ZTP provisioning handshake
 // ============================================================
 static int do_setup(const char *server, const uint8_t device_id[32], const uint8_t x[32],
-                    const char *pairing_token) {
+                    const char *pairing_token, int allow_tofu_setup) {
     double start_time = get_time_sec();
     size_t sent = 0, recv = 0;
     size_t device_cert_len = 0, device_key_len = 0, ca_cert_len = 0;
@@ -704,6 +704,12 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
     }
 
     have_pinned = (read_file_32(SERVER_PUB_FILE, pinned_server_pub) == 0);
+    if (!have_pinned && !allow_tofu_setup) {
+        fprintf(stderr,
+                "Client[SETUP/ZTP]: first-time setup requires an out-of-band pinned server key. "
+                "Run --pin-server-pub <hex> first, or pass --allow-tofu-setup for lab use.\n");
+        goto cleanup;
+    }
     fd = tcp_connect(server);
     if (fd < 0) { fprintf(stderr, "connect failed\n"); goto cleanup; }
     printf("Client[SETUP/ZTP]: Connected to %s\n", server);
@@ -806,6 +812,14 @@ static int do_setup(const char *server, const uint8_t device_id[32], const uint8
     rc = 0;
 
 cleanup:
+    sodium_memzero(server_nonce, sizeof server_nonce);
+    sodium_memzero(device_pub, sizeof device_pub);
+    sodium_memzero(client_nonce, sizeof client_nonce);
+    sodium_memzero(server_pub, sizeof server_pub);
+    sodium_memzero(transcript_hash, sizeof transcript_hash);
+    sodium_memzero(A, sizeof A);
+    sodium_memzero(s, sizeof s);
+    sodium_memzero(pinned_server_pub, sizeof pinned_server_pub);
     if (fd >= 0) close(fd);
     if (device_sig) { sodium_memzero(device_sig, device_sig_len); free(device_sig); }
     if (device_key_buf) { sodium_memzero(device_key_buf, device_key_len); free(device_key_buf); }
@@ -1013,6 +1027,7 @@ int main(int argc, char **argv) {
     const char *pairing_token = NULL;
     int setup = 0;
     int print_identity = 0;
+    int allow_tofu_setup = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--server") && i + 1 < argc) {
@@ -1021,6 +1036,8 @@ int main(int argc, char **argv) {
             setup = 1;
         } else if (!strcmp(argv[i], "--print-device-identity")) {
             print_identity = 1;
+        } else if (!strcmp(argv[i], "--allow-tofu-setup")) {
+            allow_tofu_setup = 1;
         } else if (!strcmp(argv[i], "--pairing-token") && i + 1 < argc) {
             pairing_token = argv[++i];
         } else if (!strcmp(argv[i], "--pin-server-pub") && i + 1 < argc) {
@@ -1070,7 +1087,8 @@ int main(int argc, char **argv) {
                : "Using existing device root for setup (idempotent).");
     }
 
-    int rc = setup ? do_setup(server, device_id, x, pairing_token) : do_auth_v2(server, device_id, x);
+    int rc = setup ? do_setup(server, device_id, x, pairing_token, allow_tofu_setup)
+                   : do_auth_v2(server, device_id, x);
 
     sodium_memzero(x, sizeof x);
     sodium_memzero(device_id, sizeof device_id);

@@ -22,6 +22,7 @@
 #define REGISTRY_BIN          "/var/lib/iot-auth/server/registry.bin"
 #define REGISTRY_BAK          "/var/lib/iot-auth/server/registry.bak"
 #define SERVER_SK_FILE        "/var/lib/iot-auth/server/server_sk.bin"
+#define REPLAY_CACHE_FILE     "/var/lib/iot-auth/server/replay_cache.bin"
 #define SERVER_CERT_FILE      "/var/lib/iot-auth/server/server_cert.pem"
 #define SERVER_CERT_KEY_FILE  "/var/lib/iot-auth/server/server_cert_key.pem"
 #define CA_CERT_FILE          "/var/lib/iot-auth/server/ca_cert.pem"
@@ -99,7 +100,8 @@ static int write_file_32(const char *path, const uint8_t in[32]) {
     if (!f) return -1;
     size_t n = fwrite(in, 1, 32, f);
     fclose(f);
-    return (n == 32) ? 0 : -1;
+    if (n != 32) return -1;
+    return (chmod(path, 0600) == 0) ? 0 : -1;
 }
 
 // Returns the current monotonic time in seconds.
@@ -199,6 +201,67 @@ static size_t        replay_curr_n = 0;
 static size_t        replay_prev_n = 0;
 /* FIX: replay cache access is also covered by g_reg_mutex to avoid races */
 
+static int replay_save_locked(void) {
+    FILE *f = fopen(REPLAY_CACHE_FILE ".tmp", "wb");
+    if (!f) return -1;
+
+    uint32_t curr_n = (uint32_t)replay_curr_n;
+    uint32_t prev_n = (uint32_t)replay_prev_n;
+
+    if (fwrite(&curr_n, sizeof curr_n, 1, f) != 1 ||
+        fwrite(&prev_n, sizeof prev_n, 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    if (curr_n && fwrite(replay_curr, sizeof(replay_key_t), curr_n, f) != curr_n) {
+        fclose(f);
+        return -1;
+    }
+    if (prev_n && fwrite(replay_prev, sizeof(replay_key_t), prev_n, f) != prev_n) {
+        fclose(f);
+        return -1;
+    }
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (chmod(REPLAY_CACHE_FILE ".tmp", 0600) != 0) return -1;
+    return rename(REPLAY_CACHE_FILE ".tmp", REPLAY_CACHE_FILE);
+}
+
+static int replay_load_into_memory(void) {
+    FILE *f;
+    uint32_t curr_n = 0, prev_n = 0;
+
+    if (!file_exists(REPLAY_CACHE_FILE)) return 0;
+    f = fopen(REPLAY_CACHE_FILE, "rb");
+    if (!f) return -1;
+
+    if (fread(&curr_n, sizeof curr_n, 1, f) != 1 ||
+        fread(&prev_n, sizeof prev_n, 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    if (curr_n > REPLAY_GEN_MAX || prev_n > REPLAY_GEN_MAX) {
+        fclose(f);
+        return -1;
+    }
+
+    replay_curr_n = curr_n;
+    replay_prev_n = prev_n;
+
+    if (curr_n && fread(replay_curr, sizeof(replay_key_t), curr_n, f) != curr_n) {
+        fclose(f);
+        return -1;
+    }
+    if (prev_n && fread(replay_prev, sizeof(replay_key_t), prev_n, f) != prev_n) {
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
+}
+
 // Allocates and initializes the replay-detection caches.
 static int replay_init(void) {
     replay_curr = malloc(sizeof(replay_key_t) * REPLAY_GEN_MAX);
@@ -209,7 +272,7 @@ static int replay_init(void) {
         return -1;
     }
     replay_curr_n = replay_prev_n = 0;
-    return 0;
+    return replay_load_into_memory();
 }
 
 // Rejects replayed client nonces and records new ones.
@@ -238,7 +301,7 @@ static int check_and_insert_replay(const uint8_t device_id[32],
     }
 
     memcpy(replay_curr[replay_curr_n++].key, k, 64);
-    return 0;
+    return replay_save_locked();
 }
 
 // Sends the full buffer over the socket, retrying until complete or failed.
@@ -1188,7 +1251,7 @@ int main(int argc, char **argv) {
     free(ca_cert_buf);
 
     if (replay_init() != 0) {
-        fprintf(stderr, "Failed to initialise replay cache\n");
+        fprintf(stderr, "Failed to initialise persistent replay cache\n");
         free(server_cert_buf);
         X509_free(server_cert);
         X509_free(ca_cert);

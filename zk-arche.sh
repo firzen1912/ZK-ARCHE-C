@@ -21,6 +21,7 @@ SERVER_SK_FILE="${SERVER_STATE_DIR}/server_sk.bin"
 SERVER_PUB_HEX_FILE="${SERVER_STATE_DIR}/server_pub.hex"
 SERVER_REGISTRY="${SERVER_STATE_DIR}/registry.bin"
 SERVER_REGISTRY_BAK="${SERVER_STATE_DIR}/registry.bak"
+SERVER_REPLAY_CACHE="${SERVER_STATE_DIR}/replay_cache.bin"
 
 SERVER_CERT="${SERVER_STATE_DIR}/server_cert.pem"
 SERVER_CERT_KEY="${SERVER_STATE_DIR}/server_cert_key.pem"
@@ -383,11 +384,11 @@ ${_C}CERTIFICATE COMMANDS${_N}
 
 ${_C}SERVER COMMANDS${_N}
   start-server <bind_addr> [opts]
-  server-local <bind_addr>
+  server-local <bind_addr> [--pairing-token <token>] [--pairing-seconds <n>]
   reset-server
 
 ${_C}CLIENT COMMANDS${_N}
-  setup-device <server_ip:port> [--pairing-token <token>]
+  setup-device <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
   auth-device <server_ip:port>
   show-pinned-key
   pin-server <server_pub_hex>
@@ -395,8 +396,8 @@ ${_C}CLIENT COMMANDS${_N}
   status
 
 ${_C}COMBINED FLOWS${_N}
-  client-local <server_ip:port> [--pairing-token <token>]
-  full-device-onboard <server_ip:port> [--pairing-token <token>]
+  client-local <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
+  full-device-onboard <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
   reset-all
 
 ${_C}RECOMMENDED LOCAL TEST FLOW${_N}
@@ -438,6 +439,13 @@ cmd_make_certs() {
   require_bin "$CLIENT_BIN"
   generate_bound_certs
   install_client_certs_from_generated
+
+  local server_pub
+  server_pub="$(derive_server_pub_hex)"
+  validate_hex32 "$server_pub" "server_pub"
+  log_step "Pinning generated local server public key on the client..."
+  sudo "$CLIENT_BIN" --pin-server-pub "$server_pub"
+  log_ok "Pinned local server public key for hardened setup flow"
 }
 
 # Installs the previously generated client certificate files.
@@ -456,6 +464,7 @@ cmd_check_server_certs() {
   _status_file "$SERVER_CERT_KEY" "server cert key"
   _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_REGISTRY" "device registry"
+  _status_file "$SERVER_REPLAY_CACHE" "replay cache"
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 }
 
@@ -488,21 +497,35 @@ cmd_start_server() {
 # Starts the server in local test mode with pairing enabled.
 cmd_server_local() {
   require_bin "$SERVER_BIN"
-  [[ $# -eq 1 ]] || die "server-local requires <bind_addr>"
-  local bind_addr="$1"
+  [[ $# -ge 1 ]] || die "server-local requires <bind_addr>"
+  local bind_addr="$1"; shift
+  local extra_flags=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pairing-token)
+        [[ $# -ge 2 ]] || die "--pairing-token requires a value"
+        extra_flags+=(--pairing-token "$2"); shift 2 ;;
+      --pairing-seconds)
+        [[ $# -ge 2 ]] || die "--pairing-seconds requires a value"
+        extra_flags+=(--pairing-seconds "$2"); shift 2 ;;
+      *) die "server-local: unknown option: $1" ;;
+    esac
+  done
 
   ensure_existing_demo_material
 
   log_header "Local test mode — server"
   log_info "Bind: $bind_addr"
   log_info "Pairing: enabled"
+  [[ ${#extra_flags[@]} -gt 0 ]] && log_info "Extra flags: ${extra_flags[*]}"
   echo
   log_info "In a second terminal run:"
   echo -e "    ${_Y}sudo ./zk-arche.sh client-local $bind_addr${_N}"
   echo
 
   cd "$SERVER_STATE_DIR"
-  exec sudo "$SERVER_BIN" --bind "$bind_addr" --pairing
+  exec sudo "$SERVER_BIN" --bind "$bind_addr" --pairing "${extra_flags[@]}"
 }
 
 # Pins the supplied server public key for the client.
@@ -554,6 +577,8 @@ cmd_setup_device() {
       --pairing-token)
         [[ $# -ge 2 ]] || die "--pairing-token requires a value"
         extra_flags+=(--pairing-token "$2"); shift 2 ;;
+      --allow-tofu-setup)
+        extra_flags+=(--allow-tofu-setup); shift ;;
       *) die "setup-device: unknown option: $1" ;;
     esac
   done
@@ -625,6 +650,7 @@ cmd_status() {
   _status_file "$SERVER_REGISTRY" "device registry"
   _status_file "$SERVER_REGISTRY_BAK" "device registry backup"
   _status_file "$SERVER_SK_FILE" "server static key"
+  _status_file "$SERVER_REPLAY_CACHE" "replay cache"
   _status_file "$SERVER_CA_CERT" "ca cert"
   if sudo test -f "$SERVER_CA_KEY"; then
     log_warn "ca key: present on server (consider running 'export-ca-key' for production)"
@@ -686,6 +712,8 @@ cmd_client_local() {
       --pairing-token)
         [[ $# -ge 2 ]] || die "--pairing-token requires a value"
         pairing_token_flags+=(--pairing-token "$2"); shift 2 ;;
+      --allow-tofu-setup)
+        pairing_token_flags+=(--allow-tofu-setup); shift ;;
       *) die "client-local: unknown option: $1" ;;
     esac
   done
@@ -710,6 +738,8 @@ cmd_full_device_onboard() {
       --pairing-token)
         [[ $# -ge 2 ]] || die "--pairing-token requires a value"
         setup_args+=(--pairing-token "$2"); shift 2 ;;
+      --allow-tofu-setup)
+        setup_args+=(--allow-tofu-setup); shift ;;
       *) die "full-device-onboard: unknown option: $1" ;;
     esac
   done
@@ -732,6 +762,7 @@ cmd_reset_server() {
   log_warn "Resetting server state in: $SERVER_STATE_DIR"
   sudo rm -f "$SERVER_REGISTRY" \
              "$SERVER_REGISTRY_BAK" \
+             "$SERVER_REPLAY_CACHE" \
              "$SERVER_SK_FILE" \
              "${SERVER_STATE_DIR}/server_pub.bin" \
              "$SERVER_PUB_HEX_FILE" \
