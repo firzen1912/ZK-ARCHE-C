@@ -20,6 +20,9 @@
 
 #define MSG_SETUP    0x01
 #define MSG_AUTH_V2  0x03
+#define MSG_HEARTBEAT 0x10
+#define MSG_HEARTBEAT_ACK 0x11
+#define MSG_GOODBYE 0x15
 
 #define STATE_DIR              "/var/lib/iot-auth"
 #define CLIENT_STATE_DIR       "/var/lib/iot-auth/client"
@@ -42,6 +45,18 @@
 
 typedef struct { uint64_t count; } nonce_ctr_t;
 #define NONCE_CTR_INIT { 0 }
+
+typedef struct {
+    int fd;
+    uint8_t session_key[32];
+    uint8_t rx_key[32];
+    uint8_t tx_key[32];
+    nonce_ctr_t tx_nonce;
+    nonce_ctr_t rx_nonce;
+    time_t established_at;
+    time_t last_rx;
+    time_t last_tx;
+} auth_session_t;
 
 typedef struct {
     uint8_t  version;
@@ -944,6 +959,101 @@ static int build_client_continuity_proof(continuity_proof_t *proof, continuity_s
     return 0;
 }
 
+
+static int prepare_client_continuity_proof(continuity_proof_t *proof, continuity_state_t *st,
+                                           const uint8_t device_id[32], const uint8_t x[32],
+                                           uint64_t expires_in) {
+    uint8_t pinned_server_pub[32], c[32], r[32], cx[32], checkpoint[32];
+    uint8_t device_pub[32];
+    if (expires_in == 0 || expires_in > 300) return -1;
+    if (read_file_32(SERVER_PUB_FILE, pinned_server_pub) != 0) return -1;
+    crypto_scalarmult_ristretto255_base(device_pub, x);
+    if (load_or_init_client_continuity_state(st, device_id, device_pub, pinned_server_pub) != 0) return -1;
+
+    st->continuity_counter++;
+    st->reconnect_epoch++;
+    hash_client_cont_state(st->identity, st->pubkey, pinned_server_pub,
+                           st->continuity_counter, st->reconnect_epoch, st->state_hash);
+    next_checkpoint_hash(st->last_checkpoint_hash, st->state_hash,
+                         st->continuity_counter, st->reconnect_epoch, st->last_peer_id, checkpoint);
+
+    memset(proof, 0, sizeof *proof);
+    proof->version = 1;
+    proof->role = 1;
+    memcpy(proof->identity, st->identity, 32);
+    memcpy(proof->pubkey, st->pubkey, 32);
+    memcpy(proof->peer_id, st->last_peer_id, 32);
+    proof->issued_at = unix_time_now();
+    proof->expires_at = proof->issued_at + expires_in;
+    proof->continuity_counter = st->continuity_counter;
+    proof->reconnect_epoch = st->reconnect_epoch;
+    memcpy(proof->prev_checkpoint_hash, st->last_checkpoint_hash, 32);
+    memcpy(proof->state_hash, st->state_hash, 32);
+    memcpy(proof->checkpoint_hash, checkpoint, 32);
+
+    crypto_core_ristretto255_scalar_random(r);
+    crypto_scalarmult_ristretto255_base(proof->A, r);
+    continuity_challenge_scalar(c, T_CLIENT_CONT, proof->role, proof->identity, proof->pubkey,
+                                proof->peer_id, proof->issued_at, proof->expires_at,
+                                proof->continuity_counter, proof->reconnect_epoch,
+                                proof->prev_checkpoint_hash, proof->state_hash,
+                                proof->checkpoint_hash, proof->A);
+    crypto_core_ristretto255_scalar_mul(cx, c, x);
+    crypto_core_ristretto255_scalar_add(proof->s, r, cx);
+    memcpy(st->last_checkpoint_hash, checkpoint, 32);
+    sodium_memzero(r, sizeof r);
+    sodium_memzero(c, sizeof c);
+    sodium_memzero(cx, sizeof cx);
+    return 0;
+}
+
+static int verify_server_continuity_proof_blob(const uint8_t *buf, size_t len, continuity_state_t *track_out) {
+    continuity_proof_t proof;
+    continuity_state_t track;
+    uint8_t pinned_server_pub[32], expected_identity[32], device_id[32], x[32];
+    uint8_t expected_checkpoint[32], c[32], left[32], cX[32], right[32];
+    int created = 0;
+    if (len != CONT_PROOF_LEN) return -1;
+    if (read_file_32(SERVER_PUB_FILE, pinned_server_pub) != 0) return -1;
+    server_peer_id_from_pinned_pub(pinned_server_pub, expected_identity);
+    if (continuity_proof_deserialize(&proof, buf, len) != 0) return -1;
+    if (proof.role != 2) return -1;
+    if (sodium_memcmp(proof.identity, expected_identity, 32) != 0) return -1;
+    if (sodium_memcmp(proof.pubkey, pinned_server_pub, 32) != 0) return -1;
+    if (load_device_creds_from_root(device_id, x, &created) != 0) return -1;
+    sodium_memzero(x, sizeof x);
+    if (sodium_memcmp(proof.peer_id, device_id, 32) != 0) return -1;
+    if (proof.issued_at >= proof.expires_at) return -1;
+    if (unix_time_now() < proof.issued_at || unix_time_now() > proof.expires_at) return -1;
+    if (load_server_track(&track) != 0) {
+        memset(&track, 0, sizeof track);
+        track.version = 1;
+        track.role = 2;
+        memcpy(track.identity, expected_identity, 32);
+        memcpy(track.pubkey, pinned_server_pub, 32);
+        memcpy(track.last_peer_id, device_id, 32);
+    }
+    if (proof.continuity_counter <= track.continuity_counter) return -1;
+    if (sodium_memcmp(proof.prev_checkpoint_hash, track.last_checkpoint_hash, 32) != 0) return -1;
+    next_checkpoint_hash(proof.prev_checkpoint_hash, proof.state_hash, proof.continuity_counter,
+                         proof.reconnect_epoch, proof.peer_id, expected_checkpoint);
+    if (sodium_memcmp(expected_checkpoint, proof.checkpoint_hash, 32) != 0) return -1;
+    continuity_challenge_scalar(c, T_SERVER_CONT, proof.role, proof.identity, proof.pubkey, proof.peer_id,
+                                proof.issued_at, proof.expires_at, proof.continuity_counter,
+                                proof.reconnect_epoch, proof.prev_checkpoint_hash, proof.state_hash,
+                                proof.checkpoint_hash, proof.A);
+    crypto_scalarmult_ristretto255_base(left, proof.s);
+    if (crypto_scalarmult_ristretto255(cX, c, proof.pubkey) != 0) return -1;
+    crypto_core_ristretto255_add(right, proof.A, cX);
+    if (sodium_memcmp(left, right, 32) != 0) return -1;
+    track.continuity_counter = proof.continuity_counter;
+    track.reconnect_epoch = proof.reconnect_epoch;
+    memcpy(track.last_checkpoint_hash, proof.checkpoint_hash, 32);
+    memcpy(track.state_hash, proof.state_hash, 32);
+    if (track_out) *track_out = track;
+    return 0;
+}
+
 static int verify_server_continuity_proof_from_file(const char *path) {
     continuity_proof_t proof;
     continuity_state_t track;
@@ -1373,10 +1483,46 @@ cleanup:
     return rc;
 }
 
-// Performs the client authentication and key-confirmation flow.
-static int do_auth_v2(const char *server, const uint8_t device_id[32], const uint8_t x[32]) {
+static int send_encrypted_record(int fd, const uint8_t *tx_key, nonce_ctr_t *tx_nonce,
+                                 const uint8_t *pt, size_t pt_len, size_t *sent_tracker) {
+    uint8_t nonce_buf[12];
+    uint8_t ct[MAX_ENCRYPTED_PAYLOAD + crypto_aead_chacha20poly1305_IETF_ABYTES];
+    unsigned long long ct_len = 0;
+    if (pt_len > MAX_ENCRYPTED_PAYLOAD) return -1;
+    nonce_next(tx_nonce, nonce_buf);
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(ct, &ct_len, pt, (unsigned long long)pt_len,
+                                                  NULL, 0, NULL, nonce_buf, tx_key) != 0) return -1;
+    if (send_u32_le(fd, (uint32_t)ct_len, sent_tracker) != 0) return -1;
+    return send_all(fd, ct, (size_t)ct_len, sent_tracker);
+}
+
+static int recv_encrypted_record(int fd, const uint8_t *rx_key, nonce_ctr_t *rx_nonce,
+                                 uint8_t *pt, size_t pt_cap, size_t *pt_len, size_t *recv_tracker) {
+    uint32_t rx_len = 0;
+    uint8_t *rx_ct = recv_encrypted_blob(fd, &rx_len, recv_tracker);
+    uint8_t nonce_buf[12];
+    unsigned long long out_len = 0;
+    if (!rx_ct) return -1;
+    nonce_next(rx_nonce, nonce_buf);
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(pt, &out_len, NULL, rx_ct, rx_len,
+                                                  NULL, 0, nonce_buf, rx_key) != 0) {
+        free(rx_ct);
+        return -1;
+    }
+    free(rx_ct);
+    if (out_len > pt_cap) return -1;
+    *pt_len = (size_t)out_len;
+    return 0;
+}
+
+static int do_auth_v2_open_session(const char *server, const uint8_t device_id[32], const uint8_t x[32],
+                                   auth_session_t *sess, size_t *sent_out, size_t *recv_out) {
     double start_time = get_time_sec();
     size_t sent = 0, recv = 0;
+
+    if (!sess) return -1;
+    memset(sess, 0, sizeof(*sess));
+    sess->fd = -1;
 
     uint8_t pinned_server_pub[32];
     if (read_file_32(SERVER_PUB_FILE, pinned_server_pub) != 0) {
@@ -1414,6 +1560,10 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
     crypto_generichash_final(&bst, hash, 64);
 
     uint8_t rx_key[32], tx_key[32];
+    continuity_proof_t client_cont_proof;
+    continuity_state_t pending_client_state;
+    continuity_state_t verified_server_track;
+    uint8_t cont_wire[CONT_PROOF_LEN];
     memcpy(rx_key, hash, 32);
     memcpy(tx_key, hash + 32, 32);
 
@@ -1528,11 +1678,53 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
 
     if (send_u32_le(fd, (uint32_t)ct3_len, &sent) != 0) { close(fd); return -1; }
     if (send_all(fd, ct3, (size_t)ct3_len, &sent) != 0) { close(fd); return -1; }
-    printf("Client[AUTH]: Sent encrypted client finished tag\n");
+
+    if (prepare_client_continuity_proof(&client_cont_proof, &pending_client_state,
+                                        device_id, x, 300) != 0) {
+        fprintf(stderr, "Client[CONT]: failed to prepare client continuity proof\n");
+        close(fd); return -1;
+    }
+    if (continuity_proof_serialize(&client_cont_proof, cont_wire) != 0) {
+        fprintf(stderr, "Client[CONT]: failed to serialize client continuity proof\n");
+        close(fd); return -1;
+    }
+    if (send_encrypted_record(fd, tx_key, &nonce_tx, cont_wire, sizeof cont_wire, &sent) != 0) {
+        fprintf(stderr, "Client[CONT]: failed sending client continuity proof\n");
+        close(fd); return -1;
+    }
+    {
+        uint8_t server_cont_wire[CONT_PROOF_LEN];
+        size_t server_cont_len = 0;
+        if (recv_encrypted_record(fd, rx_key, &nonce_rx,
+                                  server_cont_wire, sizeof server_cont_wire,
+                                  &server_cont_len, &recv) != 0) {
+            fprintf(stderr, "Client[CONT]: failed receiving server continuity proof\n");
+            close(fd); return -1;
+        }
+        if (verify_server_continuity_proof_blob(server_cont_wire, server_cont_len, &verified_server_track) != 0) {
+            fprintf(stderr, "Client[CONT]: server continuity proof verification failed\n");
+            close(fd); return -1;
+        }
+    }
+    if (save_client_continuity_state(&pending_client_state) != 0) { close(fd); return -1; }
+    if (save_server_track(&verified_server_track) != 0) { close(fd); return -1; }
+    printf("Client[AUTH]: Sent encrypted client finished tag and continuity proof\n");
 
     double duration = get_time_sec() - start_time;
     printf("CLIENT METRICS -> Duration: %.3fms, Sent: %zu bytes, Received: %zu bytes\n",
            duration * 1000.0, sent, recv);
+
+    sess->fd = fd;
+    memcpy(sess->session_key, session_key, 32);
+    memcpy(sess->tx_key, tx_key, 32);
+    memcpy(sess->rx_key, rx_key, 32);
+    sess->tx_nonce = nonce_tx;
+    sess->rx_nonce = nonce_rx;
+    sess->established_at = time(NULL);
+    sess->last_rx = sess->established_at;
+    sess->last_tx = sess->established_at;
+    if (sent_out) *sent_out = sent;
+    if (recv_out) *recv_out = recv;
 
     sodium_memzero(eph_secret,    sizeof eph_secret);
     sodium_memzero(session_key,   sizeof session_key);
@@ -1543,8 +1735,84 @@ static int do_auth_v2(const char *server, const uint8_t device_id[32], const uin
     sodium_memzero(tx_key,        sizeof tx_key);
     sodium_memzero(rx_key,        sizeof rx_key);
 
-    close(fd);
     return 0;
+}
+
+static void close_auth_session(auth_session_t *sess) {
+    if (!sess) return;
+    if (sess->fd >= 0) close(sess->fd);
+    sodium_memzero(sess, sizeof(*sess));
+    sess->fd = -1;
+}
+
+static int run_online_session(auth_session_t *sess, unsigned interval_secs) {
+    uint8_t pt[32];
+    size_t pt_len = 0, sent = 0, recv = 0;
+    if (!sess || sess->fd < 0) return -1;
+    printf("Client[ONLINE]: session established\n");
+    for (;;) {
+        uint8_t hb = MSG_HEARTBEAT;
+        if (send_encrypted_record(sess->fd, sess->tx_key, &sess->tx_nonce, &hb, 1, &sent) != 0) {
+            return -1;
+        }
+        sess->last_tx = time(NULL);
+        printf("Client[HB]: sent\n");
+        if (recv_encrypted_record(sess->fd, sess->rx_key, &sess->rx_nonce, pt, sizeof(pt), &pt_len, &recv) != 0) {
+            return -1;
+        }
+        sess->last_rx = time(NULL);
+        if (pt_len != 1) {
+            fprintf(stderr, "Client[HB]: invalid ack\n");
+            return -1;
+        }
+        if (pt[0] == MSG_HEARTBEAT_ACK) {
+            printf("Client[HB]: ack\n");
+        } else if (pt[0] == MSG_GOODBYE) {
+            printf("Client[ONLINE]: server closed session\n");
+            return 0;
+        } else {
+            fprintf(stderr, "Client[HB]: invalid ack\n");
+            return -1;
+        }
+        sleep(interval_secs ? interval_secs : 5);
+    }
+}
+
+// Performs the client authentication and key-confirmation flow.
+static int do_auth_v2(const char *server, const uint8_t device_id[32], const uint8_t x[32]) {
+    auth_session_t sess;
+    if (do_auth_v2_open_session(server, device_id, x, &sess, NULL, NULL) != 0) return -1;
+    close_auth_session(&sess);
+    return 0;
+}
+
+static void daemon_backoff_sleep(unsigned *attempt) {
+    unsigned a = *attempt;
+    if (a > 6) a = 6;
+    unsigned base_ms = 1000u << a;
+    uint32_t jitter = randombytes_uniform(500u);
+    unsigned total_ms = base_ms + jitter;
+    printf("Client[DAEMON]: reconnecting after %.3fs\n", total_ms / 1000.0);
+    usleep((useconds_t)total_ms * 1000u);
+    if (*attempt < 10) (*attempt)++;
+}
+
+static int run_daemon(const char *server, const uint8_t device_id[32], const uint8_t x[32], unsigned interval_secs) {
+    unsigned attempt = 0;
+    for (;;) {
+        auth_session_t sess;
+        if (do_auth_v2_open_session(server, device_id, x, &sess, NULL, NULL) != 0) {
+            fprintf(stderr, "Client[DAEMON]: connect/auth failed: %s\n", strerror(errno));
+            daemon_backoff_sleep(&attempt);
+            continue;
+        }
+        attempt = 0;
+        if (run_online_session(&sess, interval_secs) != 0) {
+            fprintf(stderr, "Client[DAEMON]: session lost: %s\n", strerror(errno));
+        }
+        close_auth_session(&sess);
+        daemon_backoff_sleep(&attempt);
+    }
 }
 
 // Prints the client command-line usage help.
@@ -1557,7 +1825,8 @@ static void usage(const char *p) {
         "  %s --print-device-identity\n"
         "  %s --make-offline-proof <file> --audience <name> --scope <scope> [--offline-expires-in <1..300>] [--request-hash <hex>|--request-file <path>]\n"
         "  %s --make-client-continuity-proof <file> [--continuity-expires-in <1..300>]\n"
-        "  %s --verify-server-continuity-proof <file>\n", p, p, p, p, p, p, p);
+        "  %s --verify-server-continuity-proof <file>\n"
+        "  %s --server 127.0.0.1:4000 --daemon [--daemon-interval-secs N]\n", p, p, p, p, p, p, p, p);
 }
 
 // Parses command-line arguments and dispatches the requested program action.
@@ -1569,6 +1838,8 @@ int main(int argc, char **argv) {
     int setup = 0;
     int print_identity = 0;
     int allow_tofu_setup = 0;
+    int daemon_mode = 0;
+    unsigned daemon_interval_secs = 5;
     const char *offline_out = NULL, *offline_audience = NULL, *offline_scope = NULL;
     const char *offline_request_hash_hex = NULL, *offline_request_file = NULL;
     uint64_t offline_expires_in = 300;
@@ -1585,6 +1856,11 @@ int main(int argc, char **argv) {
             print_identity = 1;
         } else if (!strcmp(argv[i], "--allow-tofu-setup")) {
             allow_tofu_setup = 1;
+        } else if (!strcmp(argv[i], "--daemon")) {
+            daemon_mode = 1;
+        } else if (!strcmp(argv[i], "--daemon-interval-secs") && i + 1 < argc) {
+            daemon_interval_secs = (unsigned)strtoul(argv[++i], NULL, 10);
+            if (daemon_interval_secs == 0) daemon_interval_secs = 5;
         } else if (!strcmp(argv[i], "--make-offline-proof") && i + 1 < argc) {
             offline_out = argv[++i];
         } else if (!strcmp(argv[i], "--audience") && i + 1 < argc) {
@@ -1717,7 +1993,8 @@ int main(int argc, char **argv) {
     }
 
     int rc = setup ? do_setup(server, device_id, x, pairing_token, allow_tofu_setup)
-                   : do_auth_v2(server, device_id, x);
+                   : (daemon_mode ? run_daemon(server, device_id, x, daemon_interval_secs)
+                                  : do_auth_v2(server, device_id, x));
 
     sodium_memzero(x, sizeof x);
     sodium_memzero(device_id, sizeof device_id);

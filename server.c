@@ -20,6 +20,9 @@
 
 #define MSG_SETUP    0x01
 #define MSG_AUTH_V2  0x03
+#define MSG_HEARTBEAT 0x10
+#define MSG_HEARTBEAT_ACK 0x11
+#define MSG_GOODBYE 0x15
 
 #define REGISTRY_BIN          "/var/lib/iot-auth/server/registry.bin"
 #define REGISTRY_BAK          "/var/lib/iot-auth/server/registry.bak"
@@ -1053,6 +1056,123 @@ static int build_server_continuity_proof(const char *out_path, const uint8_t ser
     return 0;
 }
 
+
+static int save_or_update_client_track(const continuity_state_t *verified_track) {
+    continuity_state_t *tracks = NULL;
+    size_t tracks_n = 0;
+    size_t idx = (size_t)-1;
+    if (load_client_tracks(&tracks, &tracks_n) != 0) {
+        tracks = NULL;
+        tracks_n = 0;
+    }
+    for (size_t i = 0; i < tracks_n; i++) {
+        if (sodium_memcmp(tracks[i].identity, verified_track->identity, 32) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == (size_t)-1) {
+        continuity_state_t *nt = realloc(tracks, (tracks_n + 1) * sizeof(*tracks));
+        if (!nt) { free(tracks); return -1; }
+        tracks = nt;
+        idx = tracks_n++;
+    }
+    tracks[idx] = *verified_track;
+    if (save_client_tracks(tracks, tracks_n) != 0) { free(tracks); return -1; }
+    free(tracks);
+    return 0;
+}
+
+static int prepare_server_continuity_proof(continuity_proof_t *p, continuity_state_t *st,
+                                           const uint8_t server_sk[32], const uint8_t server_pub[32],
+                                           reg_entry_t *reg, size_t reg_n, const uint8_t peer_id[32],
+                                           uint64_t expires_in) {
+    uint8_t r[32], c[32], cx[32], checkpoint[32];
+    if (expires_in == 0 || expires_in > 300) return -1;
+    if (load_or_init_server_cont_state(st, server_pub, reg, reg_n, peer_id) != 0) return -1;
+    memcpy(st->last_peer_id, peer_id, 32);
+    st->continuity_counter++;
+    st->reconnect_epoch++;
+    hash_server_cont_state(st->identity, st->pubkey, reg, reg_n,
+                           st->continuity_counter, st->reconnect_epoch, peer_id, st->state_hash);
+    next_checkpoint_hash(st->last_checkpoint_hash, st->state_hash,
+                         st->continuity_counter, st->reconnect_epoch, peer_id, checkpoint);
+    memset(p, 0, sizeof *p);
+    p->version = 1;
+    p->role = 2;
+    memcpy(p->identity, st->identity, 32);
+    memcpy(p->pubkey, st->pubkey, 32);
+    memcpy(p->peer_id, peer_id, 32);
+    p->issued_at = unix_time_now();
+    p->expires_at = p->issued_at + expires_in;
+    p->continuity_counter = st->continuity_counter;
+    p->reconnect_epoch = st->reconnect_epoch;
+    memcpy(p->prev_checkpoint_hash, st->last_checkpoint_hash, 32);
+    memcpy(p->state_hash, st->state_hash, 32);
+    memcpy(p->checkpoint_hash, checkpoint, 32);
+    crypto_core_ristretto255_scalar_random(r);
+    crypto_scalarmult_ristretto255_base(p->A, r);
+    continuity_challenge_scalar(c, T_SERVER_CONT, p);
+    crypto_core_ristretto255_scalar_mul(cx, c, server_sk);
+    crypto_core_ristretto255_scalar_add(p->s, r, cx);
+    memcpy(st->last_checkpoint_hash, checkpoint, 32);
+    sodium_memzero(r, sizeof r);
+    sodium_memzero(c, sizeof c);
+    sodium_memzero(cx, sizeof cx);
+    return 0;
+}
+
+static int verify_client_continuity_proof_blob(const uint8_t *buf, size_t len,
+                                               const uint8_t server_pub[32],
+                                               reg_entry_t *reg, size_t reg_n,
+                                               continuity_state_t *verified_track) {
+    continuity_proof_t p;
+    continuity_state_t *tracks = NULL;
+    size_t tracks_n = 0;
+    uint8_t c[32], left[32], cX[32], right[32], expected_pub[32], expected_peer[32], checkpoint[32];
+    size_t idx = (size_t)-1;
+
+    if (len != CONT_PROOF_LEN) return -1;
+    if (continuity_proof_deserialize(&p, buf, len) != 0) return -1;
+    if (p.role != 1) return -1;
+    if (reg_lookup(reg, reg_n, p.identity, expected_pub) != 0) return -1;
+    if (sodium_memcmp(expected_pub, p.pubkey, 32) != 0) return -1;
+    server_identity_from_pub(server_pub, expected_peer);
+    if (sodium_memcmp(p.peer_id, expected_peer, 32) != 0) return -1;
+    if (p.issued_at >= p.expires_at || unix_time_now() < p.issued_at || unix_time_now() > p.expires_at) return -1;
+    if (load_client_tracks(&tracks, &tracks_n) != 0) {
+        tracks = NULL;
+        tracks_n = 0;
+    }
+    for (size_t i = 0; i < tracks_n; i++) if (sodium_memcmp(tracks[i].identity, p.identity, 32) == 0) { idx = i; break; }
+    if (idx == (size_t)-1) {
+        continuity_state_t *nt = realloc(tracks, (tracks_n + 1) * sizeof(*tracks));
+        if (!nt) { free(tracks); return -1; }
+        tracks = nt; idx = tracks_n++;
+        memset(&tracks[idx], 0, sizeof tracks[idx]);
+        tracks[idx].version = 1; tracks[idx].role = 1;
+        memcpy(tracks[idx].identity, p.identity, 32);
+        memcpy(tracks[idx].pubkey, p.pubkey, 32);
+        memcpy(tracks[idx].last_peer_id, expected_peer, 32);
+    }
+    if (p.continuity_counter <= tracks[idx].continuity_counter) { free(tracks); return -1; }
+    if (sodium_memcmp(p.prev_checkpoint_hash, tracks[idx].last_checkpoint_hash, 32) != 0) { free(tracks); return -1; }
+    next_checkpoint_hash(p.prev_checkpoint_hash, p.state_hash, p.continuity_counter, p.reconnect_epoch, p.peer_id, checkpoint);
+    if (sodium_memcmp(checkpoint, p.checkpoint_hash, 32) != 0) { free(tracks); return -1; }
+    continuity_challenge_scalar(c, T_CLIENT_CONT, &p);
+    crypto_scalarmult_ristretto255_base(left, p.s);
+    if (crypto_scalarmult_ristretto255(cX, c, expected_pub) != 0) { free(tracks); return -1; }
+    crypto_core_ristretto255_add(right, p.A, cX);
+    if (sodium_memcmp(left, right, 32) != 0) { free(tracks); return -1; }
+    tracks[idx].continuity_counter = p.continuity_counter;
+    tracks[idx].reconnect_epoch = p.reconnect_epoch;
+    memcpy(tracks[idx].last_checkpoint_hash, p.checkpoint_hash, 32);
+    memcpy(tracks[idx].state_hash, p.state_hash, 32);
+    if (verified_track) *verified_track = tracks[idx];
+    free(tracks);
+    return 0;
+}
+
 static int verify_client_continuity_proof(const char *path, const uint8_t server_pub[32], reg_entry_t *reg, size_t reg_n) {
     continuity_proof_t p;
     continuity_state_t *tracks = NULL;
@@ -1492,6 +1612,71 @@ static int parse_bind(const char *bind_str, char ip[64], uint16_t *port) {
     return 0;
 }
 
+
+static int send_encrypted_record(int fd, const uint8_t *tx_key, nonce_ctr_t *tx_nonce,
+                                 const uint8_t *pt, size_t pt_len, size_t *sent_tracker) {
+    uint8_t nonce_buf[12];
+    uint8_t ct[MAX_ENCRYPTED_PAYLOAD + crypto_aead_chacha20poly1305_IETF_ABYTES];
+    unsigned long long ct_len = 0;
+    if (pt_len > MAX_ENCRYPTED_PAYLOAD) return -1;
+    nonce_next(tx_nonce, nonce_buf);
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(ct, &ct_len, pt, (unsigned long long)pt_len,
+                                                  NULL, 0, NULL, nonce_buf, tx_key) != 0) return -1;
+    if (send_u32_le(fd, (uint32_t)ct_len, sent_tracker) != 0) return -1;
+    return send_all(fd, ct, (size_t)ct_len, sent_tracker);
+}
+
+static int recv_encrypted_record(int fd, const uint8_t *rx_key, nonce_ctr_t *rx_nonce,
+                                 uint8_t *pt, size_t pt_cap, size_t *pt_len, size_t *recv_tracker) {
+    uint32_t rx_len = 0;
+    uint8_t *rx_ct = recv_encrypted_blob(fd, &rx_len, recv_tracker);
+    uint8_t nonce_buf[12];
+    unsigned long long out_len = 0;
+    if (!rx_ct) return -1;
+    nonce_next(rx_nonce, nonce_buf);
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(pt, &out_len, NULL, rx_ct, rx_len,
+                                                  NULL, 0, nonce_buf, rx_key) != 0) {
+        free(rx_ct);
+        return -1;
+    }
+    free(rx_ct);
+    if (out_len > pt_cap) return -1;
+    *pt_len = (size_t)out_len;
+    return 0;
+}
+
+static int run_online_session_server(int cfd, const uint8_t device_id[32],
+                                     uint8_t rx_key[32], uint8_t tx_key[32],
+                                     nonce_ctr_t *nonce_rx, nonce_ctr_t *nonce_tx,
+                                     size_t *sent, size_t *recv_bytes) {
+    uint8_t pt[32];
+    size_t pt_len = 0;
+    char hex_id[65];
+    sodium_bin2hex(hex_id, sizeof hex_id, device_id, 32);
+    printf("Server[ONLINE]: session established for %s\n", hex_id);
+    for (;;) {
+        if (recv_encrypted_record(cfd, rx_key, nonce_rx, pt, sizeof(pt), &pt_len, recv_bytes) != 0) {
+            return -1;
+        }
+        if (pt_len != 1) {
+            fprintf(stderr, "Server[ONLINE]: invalid message from %s\n", hex_id);
+            return -1;
+        }
+        if (pt[0] == MSG_GOODBYE) {
+            printf("Server[ONLINE]: client %s closed session\n", hex_id);
+            return 0;
+        }
+        if (pt[0] != MSG_HEARTBEAT) {
+            fprintf(stderr, "Server[ONLINE]: invalid message from %s\n", hex_id);
+            return -1;
+        }
+        printf("Server[HB]: heartbeat from %s\n", hex_id);
+        {
+            uint8_t ack = MSG_HEARTBEAT_ACK;
+            if (send_encrypted_record(cfd, tx_key, nonce_tx, &ack, 1, sent) != 0) return -1;
+        }
+    }
+}
 // Processes one client connection for setup or authentication.
 // reg and reg_n are protected by g_reg_mutex for all read/write accesses.
 static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *reg_n,
@@ -1783,19 +1968,62 @@ static void handle_client(int cfd, const char *peer, reg_entry_t **reg, size_t *
         }
 
         uint8_t expected_tag_c[32];
+        continuity_state_t verified_client_track;
+        continuity_state_t pending_server_state;
+        continuity_proof_t server_cont_proof;
+        uint8_t cont_wire[CONT_PROOF_LEN];
         hmac_tag(expected_tag_c, k_c2s, "client finished", th);
         if (sodium_memcmp(expected_tag_c, pt3, 32) != 0) {
             fprintf(stderr, "Server[AUTH]: key confirmation failed (tag_c mismatch)\n");
             goto cleanup;
         }
 
+        {
+            uint8_t client_cont_wire[CONT_PROOF_LEN];
+            size_t client_cont_len = 0;
+            if (recv_encrypted_record(cfd, rx_key, &nonce_rx,
+                                      client_cont_wire, sizeof client_cont_wire,
+                                      &client_cont_len, &recv_bytes) != 0) {
+                fprintf(stderr, "Server[CONT]: failed receiving client continuity proof\n");
+                goto cleanup;
+            }
+            pthread_mutex_lock(&g_reg_mutex);
+            int cont_ok = verify_client_continuity_proof_blob(client_cont_wire, client_cont_len,
+                                                              server_pub, *reg, *reg_n,
+                                                              &verified_client_track);
+            pthread_mutex_unlock(&g_reg_mutex);
+            if (cont_ok != 0) {
+                fprintf(stderr, "Server[CONT]: client continuity verification failed\n");
+                goto cleanup;
+            }
+        }
+
+        pthread_mutex_lock(&g_reg_mutex);
+        int prep_ok = prepare_server_continuity_proof(&server_cont_proof, &pending_server_state,
+                                                      server_sk, server_pub, *reg, *reg_n,
+                                                      device_id, 300);
+        pthread_mutex_unlock(&g_reg_mutex);
+        if (prep_ok != 0) {
+            fprintf(stderr, "Server[CONT]: failed preparing server continuity proof\n");
+            goto cleanup;
+        }
+        if (continuity_proof_serialize(&server_cont_proof, cont_wire) != 0) goto cleanup;
+        if (send_encrypted_record(cfd, tx_key, &nonce_tx, cont_wire, sizeof cont_wire, &sent) != 0) {
+            fprintf(stderr, "Server[CONT]: failed sending server continuity proof\n");
+            goto cleanup;
+        }
+        if (save_or_update_client_track(&verified_client_track) != 0) goto cleanup;
+        if (save_server_cont_state(&pending_server_state) != 0) goto cleanup;
+
         /* FIX: session key removed from log — it must never appear in stdout/logs.
            Only the device_id (public identifier) is logged. */
         char hex_id[65];
         sodium_bin2hex(hex_id, sizeof hex_id, device_id, 32);
-        printf("Server[AUTH]: device_id=%s KC=OK\n", hex_id);
+        printf("Server[AUTH]: device_id=%s KC=OK continuity=OK\n", hex_id);
         rate_limit_record_success(peer);
         success = 1;
+
+        (void)run_online_session_server(cfd, device_id, rx_key, tx_key, &nonce_rx, &nonce_tx, &sent, &recv_bytes);
 
         sodium_memzero(eph_s_secret,  sizeof eph_s_secret);
         sodium_memzero(session_key,   sizeof session_key);
