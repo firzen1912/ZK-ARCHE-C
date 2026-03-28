@@ -28,10 +28,20 @@
 #define SERVER_CERT_FILE      "/var/lib/iot-auth/server/server_cert.pem"
 #define SERVER_CERT_KEY_FILE  "/var/lib/iot-auth/server/server_cert_key.pem"
 #define CA_CERT_FILE          "/var/lib/iot-auth/server/ca_cert.pem"
+#define OFFLINE_COUNTERS_FILE "/var/lib/iot-auth/server/offline_counters.bin"
+#define SERVER_CONT_FILE      "/var/lib/iot-auth/server/continuity.bin"
+#define CLIENT_CONT_TRACKS    "/var/lib/iot-auth/server/client_continuity_tracks.bin"
 #define MAX_ENCRYPTED_PAYLOAD  4096
 #define REPLAY_GEN_MAX  25000
 #define MAX_CERT_FILE_SIZE (128 * 1024)
 #define MAX_SIG_SIZE 8192
+#define MAX_OFFLINE_FIELD 256
+#define CONT_STATE_LEN 178u
+#define CONT_PROOF_LEN 290u
+
+#define T_OFFLINE      "offline_schnorr_v1"
+#define T_CLIENT_CONT  "client_continuity_v1"
+#define T_SERVER_CONT  "server_continuity_v1"
 #define CERT_MAX_VALIDITY_DAYS 30
 #define MAX_ACTIVE_CONNECTIONS 64
 #define FAIL_WINDOW_SEC 60.0
@@ -45,6 +55,90 @@
 
 typedef struct { uint64_t count; } nonce_ctr_t;
 #define NONCE_CTR_INIT { 0 }
+
+typedef struct { uint8_t buf[4096]; size_t len; } transcript_t;
+
+// Initializes a transcript with its domain separation label.
+static void tr_init(transcript_t *tr, const char *domain) {
+    tr->len = 0;
+    size_t dlen = strlen(domain);
+    if (dlen > 255) { fprintf(stderr, "domain too long\n"); exit(1); }
+    tr->buf[tr->len++] = (uint8_t)dlen;
+    memcpy(tr->buf + tr->len, domain, dlen);
+    tr->len += dlen;
+}
+
+// Appends a labeled value to the transcript buffer.
+static void tr_append(transcript_t *tr, const char *label, const uint8_t *val, uint32_t vlen) {
+    size_t llen = strlen(label);
+    if (llen > 255) { fprintf(stderr, "label too long\n"); exit(1); }
+    if (tr->len + 1 + llen + 4 + (size_t)vlen > sizeof(tr->buf)) {
+        fprintf(stderr, "transcript overflow\n"); exit(1);
+    }
+    tr->buf[tr->len++] = (uint8_t)llen;
+    memcpy(tr->buf + tr->len, label, llen);
+    tr->len += llen;
+    tr->buf[tr->len++] = (uint8_t)(vlen);
+    tr->buf[tr->len++] = (uint8_t)(vlen >> 8);
+    tr->buf[tr->len++] = (uint8_t)(vlen >> 16);
+    tr->buf[tr->len++] = (uint8_t)(vlen >> 24);
+    memcpy(tr->buf + tr->len, val, vlen);
+    tr->len += vlen;
+}
+
+// Hashes the transcript and reduces it to a Ristretto scalar challenge.
+static void tr_challenge_scalar(uint8_t c_out[32], const transcript_t *tr) {
+    uint8_t h[64];
+    crypto_hash_sha512(h, tr->buf, (unsigned long long)tr->len);
+    crypto_core_ristretto255_scalar_reduce(c_out, h);
+}
+
+
+
+typedef struct {
+    uint8_t  version;
+    uint8_t  device_id[32];
+    uint8_t  device_pub[32];
+    uint64_t issued_at;
+    uint64_t expires_at;
+    uint64_t counter;
+    uint16_t audience_len;
+    uint8_t  audience[MAX_OFFLINE_FIELD];
+    uint16_t scope_len;
+    uint8_t  scope[MAX_OFFLINE_FIELD];
+    uint8_t  request_hash[32];
+    uint8_t  A[32];
+    uint8_t  s[32];
+} offline_proof_t;
+
+typedef struct {
+    uint8_t  version;
+    uint8_t  role;
+    uint8_t  identity[32];
+    uint8_t  pubkey[32];
+    uint64_t continuity_counter;
+    uint64_t reconnect_epoch;
+    uint8_t  last_peer_id[32];
+    uint8_t  last_checkpoint_hash[32];
+    uint8_t  state_hash[32];
+} continuity_state_t;
+
+typedef struct {
+    uint8_t  version;
+    uint8_t  role;
+    uint8_t  identity[32];
+    uint8_t  pubkey[32];
+    uint8_t  peer_id[32];
+    uint64_t issued_at;
+    uint64_t expires_at;
+    uint64_t continuity_counter;
+    uint64_t reconnect_epoch;
+    uint8_t  prev_checkpoint_hash[32];
+    uint8_t  state_hash[32];
+    uint8_t  checkpoint_hash[32];
+    uint8_t  A[32];
+    uint8_t  s[32];
+} continuity_proof_t;
 
 // Generates the next 96-bit nonce from the local monotonic counter.
 static void nonce_next(nonce_ctr_t *c, uint8_t out[12]) {
@@ -82,6 +176,7 @@ static size_t g_failure_n = 0;
 
 static double get_time_sec(void);
 static int replay_maybe_flush_locked(int force);
+static uint8_t *read_file_all(const char *path, size_t *out_len, size_t max_len);
 
 static int require_private_file_mode(const char *path) {
     struct stat st;
@@ -567,6 +662,445 @@ static int recv_pairing_token(int fd, char token_buf[129], size_t *out_len, size
     return 0;
 }
 
+static void tr_append_u64(transcript_t *tr, const char *label, uint64_t v) {
+    uint8_t le[8];
+    le[0] = (uint8_t)(v);
+    le[1] = (uint8_t)(v >> 8);
+    le[2] = (uint8_t)(v >> 16);
+    le[3] = (uint8_t)(v >> 24);
+    le[4] = (uint8_t)(v >> 32);
+    le[5] = (uint8_t)(v >> 40);
+    le[6] = (uint8_t)(v >> 48);
+    le[7] = (uint8_t)(v >> 56);
+    tr_append(tr, label, le, 8);
+}
+
+static void tr_append_u8(transcript_t *tr, const char *label, uint8_t v) {
+    tr_append(tr, label, &v, 1);
+}
+
+static uint64_t unix_time_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
+static void le64_store(uint8_t out[8], uint64_t v) {
+    out[0] = (uint8_t)(v);
+    out[1] = (uint8_t)(v >> 8);
+    out[2] = (uint8_t)(v >> 16);
+    out[3] = (uint8_t)(v >> 24);
+    out[4] = (uint8_t)(v >> 32);
+    out[5] = (uint8_t)(v >> 40);
+    out[6] = (uint8_t)(v >> 48);
+    out[7] = (uint8_t)(v >> 56);
+}
+
+static uint64_t le64_load(const uint8_t in[8]) {
+    return ((uint64_t)in[0]) |
+           ((uint64_t)in[1] << 8) |
+           ((uint64_t)in[2] << 16) |
+           ((uint64_t)in[3] << 24) |
+           ((uint64_t)in[4] << 32) |
+           ((uint64_t)in[5] << 40) |
+           ((uint64_t)in[6] << 48) |
+           ((uint64_t)in[7] << 56);
+}
+
+static int write_exact_file(const char *path, const uint8_t *buf, size_t len, mode_t mode) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    if (fwrite(buf, 1, len, f) != len) { fclose(f); return -1; }
+    fflush(f); fsync(fileno(f)); fclose(f);
+    return chmod(path, mode);
+}
+
+static int read_exact_file(const char *path, uint8_t *buf, size_t len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fread(buf, 1, len, f) != len) { fclose(f); return -1; }
+    fclose(f);
+    return 0;
+}
+
+static int parse_hash32_hex(const char *hex, uint8_t out[32]) {
+    size_t n = 0;
+    return (sodium_hex2bin(out, 32, hex, strlen(hex), NULL, &n, NULL) == 0 && n == 32) ? 0 : -1;
+}
+
+static void server_identity_from_pub(const uint8_t server_pub[32], uint8_t out[32]) {
+    crypto_generichash_state st;
+    crypto_generichash_init(&st, NULL, 0, 32);
+    crypto_generichash_update(&st, (const unsigned char *)"server-id-v1", 12);
+    crypto_generichash_update(&st, server_pub, 32);
+    crypto_generichash_final(&st, out, 32);
+}
+
+static void next_checkpoint_hash(const uint8_t prev[32], const uint8_t state_hash[32],
+                                 uint64_t counter, uint64_t epoch, const uint8_t peer_id[32],
+                                 uint8_t out[32]) {
+    uint8_t le[8];
+    crypto_generichash_state st;
+    crypto_generichash_init(&st, NULL, 0, 32);
+    crypto_generichash_update(&st, (const unsigned char *)"continuity-checkpoint-v1", 24);
+    crypto_generichash_update(&st, prev, 32);
+    crypto_generichash_update(&st, state_hash, 32);
+    le64_store(le, counter); crypto_generichash_update(&st, le, 8);
+    le64_store(le, epoch);   crypto_generichash_update(&st, le, 8);
+    crypto_generichash_update(&st, peer_id, 32);
+    crypto_generichash_final(&st, out, 32);
+}
+
+static int continuity_state_serialize(const continuity_state_t *st, uint8_t out[CONT_STATE_LEN]) {
+    size_t off = 0;
+    out[off++] = st->version;
+    out[off++] = st->role;
+    memcpy(out + off, st->identity, 32); off += 32;
+    memcpy(out + off, st->pubkey, 32); off += 32;
+    le64_store(out + off, st->continuity_counter); off += 8;
+    le64_store(out + off, st->reconnect_epoch); off += 8;
+    memcpy(out + off, st->last_peer_id, 32); off += 32;
+    memcpy(out + off, st->last_checkpoint_hash, 32); off += 32;
+    memcpy(out + off, st->state_hash, 32); off += 32;
+    return off == CONT_STATE_LEN ? 0 : -1;
+}
+
+static int continuity_state_deserialize(continuity_state_t *st, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    if (len != CONT_STATE_LEN) return -1;
+    memset(st, 0, sizeof *st);
+    st->version = buf[off++];
+    st->role = buf[off++];
+    memcpy(st->identity, buf + off, 32); off += 32;
+    memcpy(st->pubkey, buf + off, 32); off += 32;
+    st->continuity_counter = le64_load(buf + off); off += 8;
+    st->reconnect_epoch = le64_load(buf + off); off += 8;
+    memcpy(st->last_peer_id, buf + off, 32); off += 32;
+    memcpy(st->last_checkpoint_hash, buf + off, 32); off += 32;
+    memcpy(st->state_hash, buf + off, 32); off += 32;
+    return off == CONT_STATE_LEN ? 0 : -1;
+}
+
+static int continuity_proof_serialize(const continuity_proof_t *p, uint8_t out[CONT_PROOF_LEN]) {
+    size_t off = 0;
+    out[off++] = p->version;
+    out[off++] = p->role;
+    memcpy(out + off, p->identity, 32); off += 32;
+    memcpy(out + off, p->pubkey, 32); off += 32;
+    memcpy(out + off, p->peer_id, 32); off += 32;
+    le64_store(out + off, p->issued_at); off += 8;
+    le64_store(out + off, p->expires_at); off += 8;
+    le64_store(out + off, p->continuity_counter); off += 8;
+    le64_store(out + off, p->reconnect_epoch); off += 8;
+    memcpy(out + off, p->prev_checkpoint_hash, 32); off += 32;
+    memcpy(out + off, p->state_hash, 32); off += 32;
+    memcpy(out + off, p->checkpoint_hash, 32); off += 32;
+    memcpy(out + off, p->A, 32); off += 32;
+    memcpy(out + off, p->s, 32); off += 32;
+    return off == CONT_PROOF_LEN ? 0 : -1;
+}
+
+static int continuity_proof_deserialize(continuity_proof_t *p, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    if (len != CONT_PROOF_LEN) return -1;
+    memset(p, 0, sizeof *p);
+    p->version = buf[off++];
+    p->role = buf[off++];
+    memcpy(p->identity, buf + off, 32); off += 32;
+    memcpy(p->pubkey, buf + off, 32); off += 32;
+    memcpy(p->peer_id, buf + off, 32); off += 32;
+    p->issued_at = le64_load(buf + off); off += 8;
+    p->expires_at = le64_load(buf + off); off += 8;
+    p->continuity_counter = le64_load(buf + off); off += 8;
+    p->reconnect_epoch = le64_load(buf + off); off += 8;
+    memcpy(p->prev_checkpoint_hash, buf + off, 32); off += 32;
+    memcpy(p->state_hash, buf + off, 32); off += 32;
+    memcpy(p->checkpoint_hash, buf + off, 32); off += 32;
+    memcpy(p->A, buf + off, 32); off += 32;
+    memcpy(p->s, buf + off, 32); off += 32;
+    return off == CONT_PROOF_LEN ? 0 : -1;
+}
+
+static int offline_proof_deserialize(offline_proof_t *p, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    memset(p, 0, sizeof *p);
+    if (len < 1 + 32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 32) return -1;
+    p->version = buf[off++];
+    memcpy(p->device_id, buf + off, 32); off += 32;
+    memcpy(p->device_pub, buf + off, 32); off += 32;
+    p->issued_at = le64_load(buf + off); off += 8;
+    p->expires_at = le64_load(buf + off); off += 8;
+    p->counter = le64_load(buf + off); off += 8;
+    p->audience_len = (uint16_t)buf[off] | ((uint16_t)buf[off + 1] << 8); off += 2;
+    if (p->audience_len == 0 || p->audience_len > MAX_OFFLINE_FIELD || off + p->audience_len > len) return -1;
+    memcpy(p->audience, buf + off, p->audience_len); off += p->audience_len;
+    p->scope_len = (uint16_t)buf[off] | ((uint16_t)buf[off + 1] << 8); off += 2;
+    if (p->scope_len == 0 || p->scope_len > MAX_OFFLINE_FIELD || off + p->scope_len > len) return -1;
+    memcpy(p->scope, buf + off, p->scope_len); off += p->scope_len;
+    if (off + 32 + 32 + 32 != len) return -1;
+    memcpy(p->request_hash, buf + off, 32); off += 32;
+    memcpy(p->A, buf + off, 32); off += 32;
+    memcpy(p->s, buf + off, 32); off += 32;
+    return 0;
+}
+
+static void offline_challenge_scalar(uint8_t c[32], const offline_proof_t *p) {
+    transcript_t tr;
+    tr_init(&tr, T_OFFLINE);
+    tr_append(&tr, "device_id", p->device_id, 32);
+    tr_append(&tr, "pubkey", p->device_pub, 32);
+    tr_append(&tr, "audience", p->audience, p->audience_len);
+    tr_append(&tr, "scope", p->scope, p->scope_len);
+    tr_append_u64(&tr, "issued_at", p->issued_at);
+    tr_append_u64(&tr, "expires_at", p->expires_at);
+    tr_append_u64(&tr, "counter", p->counter);
+    tr_append(&tr, "request_hash", p->request_hash, 32);
+    tr_append(&tr, "a", p->A, 32);
+    tr_challenge_scalar(c, &tr);
+}
+
+static void continuity_challenge_scalar(uint8_t c[32], const char *domain, const continuity_proof_t *p) {
+    transcript_t tr;
+    tr_init(&tr, domain);
+    tr_append_u8(&tr, "role", p->role);
+    tr_append(&tr, "identity", p->identity, 32);
+    tr_append(&tr, "pubkey", p->pubkey, 32);
+    tr_append(&tr, "peer_id", p->peer_id, 32);
+    tr_append_u64(&tr, "issued_at", p->issued_at);
+    tr_append_u64(&tr, "expires_at", p->expires_at);
+    tr_append_u64(&tr, "continuity_counter", p->continuity_counter);
+    tr_append_u64(&tr, "reconnect_epoch", p->reconnect_epoch);
+    tr_append(&tr, "prev_checkpoint_hash", p->prev_checkpoint_hash, 32);
+    tr_append(&tr, "state_hash", p->state_hash, 32);
+    tr_append(&tr, "checkpoint_hash", p->checkpoint_hash, 32);
+    tr_append(&tr, "a", p->A, 32);
+    tr_challenge_scalar(c, &tr);
+}
+
+static int counter_lookup_and_update(const char *path, const uint8_t device_id[32], uint64_t counter) {
+    size_t len = 0, n = 0;
+    uint8_t *buf = read_file_all(path, &len, 1u << 20);
+    if (!buf && file_exists(path)) return -1;
+    if (buf) n = len / 40;
+    for (size_t i = 0; i < n; i++) {
+        if (sodium_memcmp(buf + i * 40, device_id, 32) == 0) {
+            uint64_t prev = le64_load(buf + i * 40 + 32);
+            if (counter <= prev) { free(buf); return -1; }
+            le64_store(buf + i * 40 + 32, counter);
+            return write_exact_file(path, buf, len, 0600) == 0 ? (free(buf), 0) : (free(buf), -1);
+        }
+    }
+    {
+        uint8_t *nb = realloc(buf, len + 40);
+        if (!nb) { free(buf); return -1; }
+        memcpy(nb + len, device_id, 32);
+        le64_store(nb + len + 32, counter);
+        if (write_exact_file(path, nb, len + 40, 0600) != 0) { free(nb); return -1; }
+        free(nb);
+    }
+    return 0;
+}
+
+static int verify_offline_proof(const char *proof_path, const char *expected_audience,
+                                const char **allowed_scopes, size_t allowed_scope_n,
+                                reg_entry_t *reg, size_t reg_n) {
+    offline_proof_t p;
+    uint8_t *buf = NULL, c[32], left[32], cX[32], right[32], expected_pub[32];
+    size_t len = 0;
+    int scope_ok = 0;
+    if (!proof_path || !expected_audience || allowed_scope_n == 0) return -1;
+    buf = read_file_all(proof_path, &len, 1u << 20);
+    if (!buf) return -1;
+    if (offline_proof_deserialize(&p, buf, len) != 0) { free(buf); return -1; }
+    free(buf);
+    if (p.version != 1) return -1;
+    if (strlen(expected_audience) != p.audience_len ||
+        sodium_memcmp(p.audience, expected_audience, p.audience_len) != 0) return -1;
+    for (size_t i = 0; i < allowed_scope_n; i++) {
+        if (strlen(allowed_scopes[i]) == p.scope_len &&
+            sodium_memcmp(p.scope, allowed_scopes[i], p.scope_len) == 0) {
+            scope_ok = 1; break;
+        }
+    }
+    if (!scope_ok) return -1;
+    if (p.issued_at >= p.expires_at || p.expires_at - p.issued_at > 300) return -1;
+    if (unix_time_now() < p.issued_at || unix_time_now() > p.expires_at) return -1;
+    if (reg_lookup(reg, reg_n, p.device_id, expected_pub) != 0) return -1;
+    if (sodium_memcmp(expected_pub, p.device_pub, 32) != 0) return -1;
+    offline_challenge_scalar(c, &p);
+    crypto_scalarmult_ristretto255_base(left, p.s);
+    if (crypto_scalarmult_ristretto255(cX, c, expected_pub) != 0) return -1;
+    crypto_core_ristretto255_add(right, p.A, cX);
+    if (sodium_memcmp(left, right, 32) != 0) return -1;
+    if (counter_lookup_and_update(OFFLINE_COUNTERS_FILE, p.device_id, p.counter) != 0) return -1;
+    printf("Server[OFFLINE]: verified offline proof file=%s device_id=", proof_path);
+    for (size_t i = 0; i < 32; i++) printf("%02x", p.device_id[i]);
+    printf(" counter=%llu\n", (unsigned long long)p.counter);
+    return 0;
+}
+
+static void hash_server_cont_state(const uint8_t server_identity[32], const uint8_t server_pub[32],
+                                   reg_entry_t *reg, size_t reg_n, uint64_t counter, uint64_t epoch,
+                                   const uint8_t peer_id[32], uint8_t out[32]) {
+    crypto_generichash_state st;
+    uint8_t le[8];
+    crypto_generichash_init(&st, NULL, 0, 32);
+    crypto_generichash_update(&st, (const unsigned char *)"server-state-v1", 15);
+    crypto_generichash_update(&st, server_identity, 32);
+    crypto_generichash_update(&st, server_pub, 32);
+    le64_store(le, counter); crypto_generichash_update(&st, le, 8);
+    le64_store(le, epoch);   crypto_generichash_update(&st, le, 8);
+    crypto_generichash_update(&st, peer_id, 32);
+    for (size_t i = 0; i < reg_n; i++) {
+        crypto_generichash_update(&st, reg[i].id, 32);
+        crypto_generichash_update(&st, reg[i].pub, 32);
+    }
+    crypto_generichash_final(&st, out, 32);
+}
+
+static int load_or_init_server_cont_state(continuity_state_t *st, const uint8_t server_pub[32],
+                                          reg_entry_t *reg, size_t reg_n, const uint8_t peer_id[32]) {
+    uint8_t buf[CONT_STATE_LEN], identity[32];
+    server_identity_from_pub(server_pub, identity);
+    if (file_exists(SERVER_CONT_FILE) && read_exact_file(SERVER_CONT_FILE, buf, sizeof buf) == 0 &&
+        continuity_state_deserialize(st, buf, sizeof buf) == 0 &&
+        st->role == 2 &&
+        sodium_memcmp(st->identity, identity, 32) == 0 &&
+        sodium_memcmp(st->pubkey, server_pub, 32) == 0) {
+        return 0;
+    }
+    memset(st, 0, sizeof *st);
+    st->version = 1;
+    st->role = 2;
+    memcpy(st->identity, identity, 32);
+    memcpy(st->pubkey, server_pub, 32);
+    memcpy(st->last_peer_id, peer_id, 32);
+    hash_server_cont_state(st->identity, st->pubkey, reg, reg_n, 0, 0, peer_id, st->state_hash);
+    continuity_state_serialize(st, buf);
+    return write_exact_file(SERVER_CONT_FILE, buf, sizeof buf, 0600);
+}
+
+static int save_server_cont_state(const continuity_state_t *st) {
+    uint8_t buf[CONT_STATE_LEN];
+    if (continuity_state_serialize(st, buf) != 0) return -1;
+    return write_exact_file(SERVER_CONT_FILE, buf, sizeof buf, 0600);
+}
+
+static int load_client_tracks(continuity_state_t **out, size_t *out_n) {
+    size_t len = 0;
+    uint8_t *buf = read_file_all(CLIENT_CONT_TRACKS, &len, 1u << 20);
+    if (!buf && file_exists(CLIENT_CONT_TRACKS)) return -1;
+    if (!buf) { *out = NULL; *out_n = 0; return 0; }
+    if (len % CONT_STATE_LEN != 0) { free(buf); return -1; }
+    *out_n = len / CONT_STATE_LEN;
+    *out = calloc(*out_n ? *out_n : 1, sizeof(**out));
+    if (!*out) { free(buf); return -1; }
+    for (size_t i = 0; i < *out_n; i++) {
+        if (continuity_state_deserialize(&(*out)[i], buf + i * CONT_STATE_LEN, CONT_STATE_LEN) != 0) {
+            free(buf); free(*out); return -1;
+        }
+    }
+    free(buf);
+    return 0;
+}
+
+static int save_client_tracks(continuity_state_t *tracks, size_t n) {
+    uint8_t *buf = calloc(n ? n : 1, CONT_STATE_LEN);
+    if (!buf) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (continuity_state_serialize(&tracks[i], buf + i * CONT_STATE_LEN) != 0) { free(buf); return -1; }
+    }
+    if (write_exact_file(CLIENT_CONT_TRACKS, buf, n * CONT_STATE_LEN, 0600) != 0) { free(buf); return -1; }
+    free(buf);
+    return 0;
+}
+
+static int build_server_continuity_proof(const char *out_path, const uint8_t server_sk[32], const uint8_t server_pub[32],
+                                         reg_entry_t *reg, size_t reg_n, const uint8_t peer_id[32], uint64_t expires_in) {
+    continuity_state_t st;
+    continuity_proof_t p;
+    uint8_t wire[CONT_PROOF_LEN], r[32], c[32], cx[32], checkpoint[32];
+    if (expires_in == 0 || expires_in > 300) return -1;
+    if (load_or_init_server_cont_state(&st, server_pub, reg, reg_n, peer_id) != 0) return -1;
+    memcpy(st.last_peer_id, peer_id, 32);
+    st.continuity_counter++;
+    st.reconnect_epoch++;
+    hash_server_cont_state(st.identity, st.pubkey, reg, reg_n, st.continuity_counter, st.reconnect_epoch, peer_id, st.state_hash);
+    next_checkpoint_hash(st.last_checkpoint_hash, st.state_hash, st.continuity_counter, st.reconnect_epoch, peer_id, checkpoint);
+    memset(&p, 0, sizeof p);
+    p.version = 1; p.role = 2;
+    memcpy(p.identity, st.identity, 32);
+    memcpy(p.pubkey, st.pubkey, 32);
+    memcpy(p.peer_id, peer_id, 32);
+    p.issued_at = unix_time_now();
+    p.expires_at = p.issued_at + expires_in;
+    p.continuity_counter = st.continuity_counter;
+    p.reconnect_epoch = st.reconnect_epoch;
+    memcpy(p.prev_checkpoint_hash, st.last_checkpoint_hash, 32);
+    memcpy(p.state_hash, st.state_hash, 32);
+    memcpy(p.checkpoint_hash, checkpoint, 32);
+    crypto_core_ristretto255_scalar_random(r);
+    crypto_scalarmult_ristretto255_base(p.A, r);
+    continuity_challenge_scalar(c, T_SERVER_CONT, &p);
+    crypto_core_ristretto255_scalar_mul(cx, c, server_sk);
+    crypto_core_ristretto255_scalar_add(p.s, r, cx);
+    memcpy(st.last_checkpoint_hash, checkpoint, 32);
+    if (save_server_cont_state(&st) != 0) return -1;
+    if (continuity_proof_serialize(&p, wire) != 0) return -1;
+    if (write_exact_file(out_path, wire, sizeof wire, 0600) != 0) return -1;
+    printf("Server[CONTINUITY]: wrote server continuity proof to %s counter=%llu reconnect_epoch=%llu\n",
+           out_path, (unsigned long long)st.continuity_counter, (unsigned long long)st.reconnect_epoch);
+    return 0;
+}
+
+static int verify_client_continuity_proof(const char *path, const uint8_t server_pub[32], reg_entry_t *reg, size_t reg_n) {
+    continuity_proof_t p;
+    continuity_state_t *tracks = NULL;
+    size_t tracks_n = 0;
+    uint8_t *buf = NULL, c[32], left[32], cX[32], right[32], expected_pub[32], expected_peer[32], checkpoint[32];
+    size_t len = 0, idx = (size_t)-1;
+    buf = read_file_all(path, &len, 1u << 20);
+    if (!buf) return -1;
+    if (continuity_proof_deserialize(&p, buf, len) != 0) { free(buf); return -1; }
+    free(buf);
+    if (p.role != 1) return -1;
+    if (reg_lookup(reg, reg_n, p.identity, expected_pub) != 0) return -1;
+    if (sodium_memcmp(expected_pub, p.pubkey, 32) != 0) return -1;
+    server_identity_from_pub(server_pub, expected_peer);
+    if (sodium_memcmp(p.peer_id, expected_peer, 32) != 0) return -1;
+    if (p.issued_at >= p.expires_at || unix_time_now() < p.issued_at || unix_time_now() > p.expires_at) return -1;
+    if (load_client_tracks(&tracks, &tracks_n) != 0) return -1;
+    for (size_t i = 0; i < tracks_n; i++) if (sodium_memcmp(tracks[i].identity, p.identity, 32) == 0) { idx = i; break; }
+    if (idx == (size_t)-1) {
+        continuity_state_t *nt = realloc(tracks, (tracks_n + 1) * sizeof(*tracks));
+        if (!nt) { free(tracks); return -1; }
+        tracks = nt; idx = tracks_n++;
+        memset(&tracks[idx], 0, sizeof tracks[idx]);
+        tracks[idx].version = 1; tracks[idx].role = 1;
+        memcpy(tracks[idx].identity, p.identity, 32);
+        memcpy(tracks[idx].pubkey, p.pubkey, 32);
+        memcpy(tracks[idx].last_peer_id, expected_peer, 32);
+    }
+    if (p.continuity_counter <= tracks[idx].continuity_counter) { free(tracks); return -1; }
+    if (sodium_memcmp(p.prev_checkpoint_hash, tracks[idx].last_checkpoint_hash, 32) != 0) { free(tracks); return -1; }
+    next_checkpoint_hash(p.prev_checkpoint_hash, p.state_hash, p.continuity_counter, p.reconnect_epoch, p.peer_id, checkpoint);
+    if (sodium_memcmp(checkpoint, p.checkpoint_hash, 32) != 0) { free(tracks); return -1; }
+    continuity_challenge_scalar(c, T_CLIENT_CONT, &p);
+    crypto_scalarmult_ristretto255_base(left, p.s);
+    if (crypto_scalarmult_ristretto255(cX, c, expected_pub) != 0) { free(tracks); return -1; }
+    crypto_core_ristretto255_add(right, p.A, cX);
+    if (sodium_memcmp(left, right, 32) != 0) { free(tracks); return -1; }
+    tracks[idx].continuity_counter = p.continuity_counter;
+    tracks[idx].reconnect_epoch = p.reconnect_epoch;
+    memcpy(tracks[idx].last_checkpoint_hash, p.checkpoint_hash, 32);
+    memcpy(tracks[idx].state_hash, p.state_hash, 32);
+    if (save_client_tracks(tracks, tracks_n) != 0) { free(tracks); return -1; }
+    free(tracks);
+    printf("Server[CONTINUITY]: verified returning client continuity proof file=%s counter=%llu reconnect_epoch=%llu\n",
+           path, (unsigned long long)p.continuity_counter, (unsigned long long)p.reconnect_epoch);
+    return 0;
+}
+
 // Rejects invalid or identity Ristretto points before cryptographic use.
 static int check_point(const uint8_t p[32], const char *what) {
     if (crypto_core_ristretto255_is_valid_point(p) != 1) {
@@ -574,43 +1108,6 @@ static int check_point(const uint8_t p[32], const char *what) {
         return -1;
     }
     return 0;
-}
-
-typedef struct { uint8_t buf[4096]; size_t len; } transcript_t;
-
-// Initializes a transcript with its domain separation label.
-static void tr_init(transcript_t *tr, const char *domain) {
-    tr->len = 0;
-    size_t dlen = strlen(domain);
-    if (dlen > 255) { fprintf(stderr, "domain too long\n"); exit(1); }
-    tr->buf[tr->len++] = (uint8_t)dlen;
-    memcpy(tr->buf + tr->len, domain, dlen);
-    tr->len += dlen;
-}
-
-// Appends a labeled value to the transcript buffer.
-static void tr_append(transcript_t *tr, const char *label, const uint8_t *val, uint32_t vlen) {
-    size_t llen = strlen(label);
-    if (llen > 255) { fprintf(stderr, "label too long\n"); exit(1); }
-    if (tr->len + 1 + llen + 4 + (size_t)vlen > sizeof(tr->buf)) {
-        fprintf(stderr, "transcript overflow\n"); exit(1);
-    }
-    tr->buf[tr->len++] = (uint8_t)llen;
-    memcpy(tr->buf + tr->len, label, llen);
-    tr->len += llen;
-    tr->buf[tr->len++] = (uint8_t)(vlen);
-    tr->buf[tr->len++] = (uint8_t)(vlen >> 8);
-    tr->buf[tr->len++] = (uint8_t)(vlen >> 16);
-    tr->buf[tr->len++] = (uint8_t)(vlen >> 24);
-    memcpy(tr->buf + tr->len, val, vlen);
-    tr->len += vlen;
-}
-
-// Hashes the transcript and reduces it to a Ristretto scalar challenge.
-static void tr_challenge_scalar(uint8_t c_out[32], const transcript_t *tr) {
-    uint8_t h[64];
-    crypto_hash_sha512(h, tr->buf, (unsigned long long)tr->len);
-    crypto_core_ristretto255_scalar_reduce(c_out, h);
 }
 
 // Verifies the client Schnorr proof during setup.
@@ -1364,6 +1861,7 @@ static void *client_thread_func(void *arg) {
 
 // Parses command-line arguments and dispatches the requested program action.
 int main(int argc, char **argv) {
+
     if (sodium_init() < 0) return 1;
 
     const char *bind_str = "0.0.0.0:4000";
@@ -1371,6 +1869,13 @@ int main(int argc, char **argv) {
     memset(&policy, 0, sizeof policy);
 
     int print_pubkey = 0;
+    const char *verify_offline_file = NULL, *offline_audience = NULL;
+    const char *make_server_cont_file = NULL, *verify_client_cont_file = NULL;
+    const char *offline_scopes[32];
+    size_t offline_scope_n = 0;
+    uint8_t continuity_peer_id[32];
+    int have_cont_peer = 0;
+    uint64_t continuity_expires_in = 300;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bind") && i + 1 < argc) {
@@ -1388,10 +1893,29 @@ int main(int argc, char **argv) {
             policy.deadline_sec = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9 + secs;
         } else if (!strcmp(argv[i], "--print-pubkey")) {
             print_pubkey = 1;
+        } else if (!strcmp(argv[i], "--verify-offline-proof") && i + 1 < argc) {
+            verify_offline_file = argv[++i];
+        } else if (!strcmp(argv[i], "--audience") && i + 1 < argc) {
+            offline_audience = argv[++i];
+        } else if (!strcmp(argv[i], "--allow-offline-scope") && i + 1 < argc) {
+            if (offline_scope_n >= 32) { fprintf(stderr, "too many offline scopes\n"); return 1; }
+            offline_scopes[offline_scope_n++] = argv[++i];
+        } else if (!strcmp(argv[i], "--make-server-continuity-proof") && i + 1 < argc) {
+            make_server_cont_file = argv[++i];
+        } else if (!strcmp(argv[i], "--verify-client-continuity-proof") && i + 1 < argc) {
+            verify_client_cont_file = argv[++i];
+        } else if (!strcmp(argv[i], "--peer-id") && i + 1 < argc) {
+            if (parse_hash32_hex(argv[++i], continuity_peer_id) != 0) { fprintf(stderr, "bad --peer-id\n"); return 1; }
+            have_cont_peer = 1;
+        } else if (!strcmp(argv[i], "--continuity-expires-in") && i + 1 < argc) {
+            continuity_expires_in = (uint64_t)strtoull(argv[++i], NULL, 10);
         } else {
             fprintf(stderr,
                     "Usage: %s [--bind 0.0.0.0:4000] [--pairing] "
-                    "[--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]\n", argv[0]);
+                    "[--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey] "
+                    "[--verify-offline-proof FILE --audience NAME --allow-offline-scope SCOPE ...] "
+                    "[--make-server-continuity-proof FILE --peer-id HEX32 [--continuity-expires-in N]] "
+                    "[--verify-client-continuity-proof FILE]\n", argv[0]);
             return 1;
         }
     }
@@ -1500,6 +2024,26 @@ int main(int argc, char **argv) {
         EVP_PKEY_free(server_cert_key);
         sodium_memzero(server_sk, sizeof server_sk);
         return 1;
+    }
+
+    if (verify_offline_file) {
+        if (!offline_audience || offline_scope_n == 0) {
+            fprintf(stderr, "--verify-offline-proof requires --audience and at least one --allow-offline-scope\n");
+            return 1;
+        }
+        return verify_offline_proof(verify_offline_file, offline_audience, offline_scopes, offline_scope_n, reg, reg_n) == 0 ? 0 : 1;
+    }
+
+    if (verify_client_cont_file) {
+        return verify_client_continuity_proof(verify_client_cont_file, server_pub, reg, reg_n) == 0 ? 0 : 1;
+    }
+
+    if (make_server_cont_file) {
+        if (!have_cont_peer) {
+            fprintf(stderr, "--make-server-continuity-proof requires --peer-id\n");
+            return 1;
+        }
+        return build_server_continuity_proof(make_server_cont_file, server_sk, server_pub, reg, reg_n, continuity_peer_id, continuity_expires_in) == 0 ? 0 : 1;
     }
 
     int lfd = listen_tcp(ip, port);
