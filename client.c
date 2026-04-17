@@ -743,18 +743,11 @@ fail:
 
 static int do_auth(const char *server_addr) {
     uint8_t device_id[32], x[32], pinned_server_pub[32], device_pub[32];
-    uint8_t client_pk[32], client_sk[32], server_pk[32], x25519_shared[32], hash[64];
     uint8_t nonce_c[32], eph_secret[32], eph_c[32], pid[32], A_c[32], s_c[32];
     uint8_t c_prime[32], blind_prime[32], delta[32], rerand_A[32], rerand_s[32];
     uint8_t or_proof[ALLOWED_ROLE_COUNT][96];
-    uint8_t session_key[32], th[32], k_s2c[32], k_c2s[32], tx_key[32], rx_key[32], expected_s[32], tag_c[32];
-    uint8_t payload1[256 + 96 * ALLOWED_ROLE_COUNT], pt2[192], server_pub2[32], A_s[32], s_s[32], nonce_s[32], eph_s[32], tag_s[32];
-    uint8_t ct1[sizeof(payload1) + crypto_aead_chacha20poly1305_IETF_ABYTES], ct3[32 + crypto_aead_chacha20poly1305_IETF_ABYTES];
-    unsigned long long ct1_len, ct3_len, pt2_len;
-    uint32_t rx_len;
-    uint8_t *rx_ct = NULL;
-    nonce_ctr_t nonce_tx = {0}, nonce_rx = {0};
-    uint8_t nonce_buf[12];
+    uint8_t session_key[32], th[32], k_s2c[32], k_c2s[32], expected_s[32], tag_c[32];
+    uint8_t payload1[256 + 96 * ALLOWED_ROLE_COUNT], payload2[192], server_pub2[32], A_s[32], s_s[32], nonce_s[32], eph_s[32], tag_s[32];
     size_t sent = 0, recv_bytes = 0;
     int fd = -1;
     role_cred_t cred;
@@ -770,24 +763,10 @@ static int do_auth(const char *server_addr) {
     crypto_scalarmult_ristretto255_base(device_pub, x);
     if (check_point(device_pub, "device_static_pub") != 0) return -1;
 
-    crypto_kx_keypair(client_pk, client_sk);
     fd = tcp_connect(server_addr);
     if (fd < 0) return -1;
     printf("Client[AUTH]: Connected to %s\n", server_addr);
     { uint8_t m = MSG_AUTH_V2; if (send_all(fd, &m, 1, &sent) != 0) goto fail; }
-    if (send_all(fd, client_pk, 32, &sent) != 0) goto fail;
-    if (recv_all(fd, server_pk, 32, &recv_bytes) != 0) goto fail;
-    if (crypto_scalarmult(x25519_shared, client_sk, server_pk) != 0) goto fail;
-    {
-        crypto_generichash_state st;
-        crypto_generichash_init(&st, NULL, 0, 64);
-        crypto_generichash_update(&st, x25519_shared, 32);
-        crypto_generichash_update(&st, client_pk, 32);
-        crypto_generichash_update(&st, server_pk, 32);
-        crypto_generichash_final(&st, hash, 64);
-        memcpy(rx_key, hash, 32);
-        memcpy(tx_key, hash + 32, 32);
-    }
 
     randombytes_buf(nonce_c, 32);
     crypto_core_ristretto255_scalar_random(eph_secret);
@@ -808,42 +787,43 @@ static int do_auth(const char *server_addr) {
     memcpy(payload1 + off, rerand_s, 32); off += 32;
     for (i = 0; i < ALLOWED_ROLE_COUNT; i++) { memcpy(payload1 + off, or_proof[i], 96); off += 96; }
 
-    nonce_next(&nonce_tx, nonce_buf);
-    crypto_aead_chacha20poly1305_ietf_encrypt(ct1, &ct1_len, payload1, (unsigned long long)off, NULL, 0, NULL, nonce_buf, tx_key);
-    if (send_u32_le(fd, (uint32_t)ct1_len, &sent) != 0) goto fail;
-    if (send_all(fd, ct1, (size_t)ct1_len, &sent) != 0) goto fail;
+    if (send_all(fd, payload1, off, &sent) != 0) goto fail;
+    if (recv_all(fd, payload2, sizeof(payload2), &recv_bytes) != 0) goto fail;
 
-    rx_ct = recv_encrypted_blob(fd, &rx_len, &recv_bytes);
-    if (!rx_ct) goto fail;
-    nonce_next(&nonce_rx, nonce_buf);
-    if (crypto_aead_chacha20poly1305_ietf_decrypt(pt2, &pt2_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) goto fail;
-    free(rx_ct); rx_ct = NULL;
-    if (pt2_len != 192) goto fail;
-    memcpy(server_pub2, pt2, 32); memcpy(A_s, pt2 + 32, 32); memcpy(s_s, pt2 + 64, 32); memcpy(nonce_s, pt2 + 96, 32); memcpy(eph_s, pt2 + 128, 32); memcpy(tag_s, pt2 + 160, 32);
+    memcpy(server_pub2, payload2, 32);
+    memcpy(A_s,         payload2 + 32, 32);
+    memcpy(s_s,         payload2 + 64, 32);
+    memcpy(nonce_s,     payload2 + 96, 32);
+    memcpy(eph_s,       payload2 + 128, 32);
+    memcpy(tag_s,       payload2 + 160, 32);
+
     if (check_point(server_pub2, "server_pub2") != 0 || check_point(A_s, "A_s") != 0 || check_point(eph_s, "eph_s") != 0) goto fail;
     if (sodium_memcmp(server_pub2, pinned_server_pub, 32) != 0) { fprintf(stderr, "Client[AUTH]: server pubkey mismatch\n"); goto fail; }
     if (schnorr_verify_server(server_pub2, A_s, s_s, nonce_s, eph_s) != 0) { fprintf(stderr, "Client[AUTH]: Server Schnorr proof FAILED\n"); goto fail; }
     printf("Client[AUTH]: Server Schnorr proof OK\n");
+
     if (derive_session_key(session_key, eph_secret, eph_s, nonce_c, nonce_s, pid, eph_c, eph_s) != 0) goto fail;
     kc_transcript_hash(th, pid, A_c, s_c, nonce_c, eph_c, server_pub2, A_s, s_s, nonce_s, eph_s);
     derive_kc_keys(k_s2c, k_c2s, session_key, th);
     hmac_tag(expected_s, k_s2c, "server finished", th);
     if (sodium_memcmp(expected_s, tag_s, 32) != 0) { fprintf(stderr, "Client[AUTH]: server finished mismatch\n"); goto fail; }
     printf("Client[AUTH]: Key confirmation (server finished) OK\n");
+
     hmac_tag(tag_c, k_c2s, "client finished", th);
-    nonce_next(&nonce_tx, nonce_buf);
-    crypto_aead_chacha20poly1305_ietf_encrypt(ct3, &ct3_len, tag_c, 32, NULL, 0, NULL, nonce_buf, tx_key);
-    if (send_u32_le(fd, (uint32_t)ct3_len, &sent) != 0) goto fail;
-    if (send_all(fd, ct3, (size_t)ct3_len, &sent) != 0) goto fail;
+    if (send_all(fd, tag_c, 32, &sent) != 0) goto fail;
     printf("Client[AUTH]: Sent encrypted client finished tag\n");
     print_client_metrics(start_ms, sent, recv_bytes);
     close(fd);
-    sodium_memzero(x, sizeof x); sodium_memzero(client_sk, sizeof client_sk); sodium_memzero(eph_secret, sizeof eph_secret); sodium_memzero(x25519_shared, sizeof x25519_shared); sodium_memzero(session_key, sizeof session_key);
+    sodium_memzero(x, sizeof x);
+    sodium_memzero(eph_secret, sizeof eph_secret);
+    sodium_memzero(session_key, sizeof session_key);
     return 0;
 fail:
     perror("auth");
-    free(rx_ct); if (fd >= 0) close(fd);
-    sodium_memzero(x, sizeof x); sodium_memzero(client_sk, sizeof client_sk); sodium_memzero(eph_secret, sizeof eph_secret); sodium_memzero(x25519_shared, sizeof x25519_shared); sodium_memzero(session_key, sizeof session_key);
+    if (fd >= 0) close(fd);
+    sodium_memzero(x, sizeof x);
+    sodium_memzero(eph_secret, sizeof eph_secret);
+    sodium_memzero(session_key, sizeof session_key);
     return -1;
 }
 

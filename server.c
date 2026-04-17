@@ -706,60 +706,52 @@ static int handle_client(int cfd, const uint8_t server_sk[32], const uint8_t ser
     }
 
     if (msg == MSG_AUTH_V2) {
-        uint8_t client_pk[32], srv_pk[32], srv_sk_x[32], x25519_shared[32], hash[64], rx_key[32], tx_key[32];
-        nonce_ctr_t nonce_rx = {0}, nonce_tx = {0};
-        uint32_t rx_len; uint8_t *rx_ct = NULL; uint8_t nonce_buf[12];
-        uint8_t pt1[256 + 96 * ALLOWED_ROLE_COUNT]; unsigned long long pt1_len;
+        uint8_t payload1[256 + 96 * ALLOWED_ROLE_COUNT];
         uint8_t pid[32], A_c[32], s_c[32], nonce_c[32], eph_c[32], c_prime[32], rerand_A[32], rerand_s[32];
         uint8_t or_proof[ALLOWED_ROLE_COUNT][96];
-        reg_entry_t record; uint8_t nonce_s[32], eph_s_secret[32], eph_s[32], A_s[32], s_s[32], session_key[32], th[32], k_s2c[32], k_c2s[32], tag_s[32], expected_tag_c[32], payload2[192], pt3[32];
-        unsigned long long pt3_len, ct2_len; uint8_t ct2[192 + crypto_aead_chacha20poly1305_IETF_ABYTES];
+        reg_entry_t record;
+        uint8_t nonce_s[32], eph_s_secret[32], eph_s[32], A_s[32], s_s[32], session_key[32], th[32], k_s2c[32], k_c2s[32], tag_s[32], expected_tag_c[32], payload2[192], tag_c[32];
         size_t off = 0, i;
 
-        if (recv_all(cfd, client_pk, 32, &recv_bytes) != 0) return -1;
-        crypto_kx_keypair(srv_pk, srv_sk_x);
-        if (send_all(cfd, srv_pk, 32, &sent) != 0) return -1;
-        if (crypto_scalarmult(x25519_shared, srv_sk_x, client_pk) != 0) return -1;
-        {
-            crypto_generichash_state st;
-            crypto_generichash_init(&st, NULL, 0, 64);
-            crypto_generichash_update(&st, x25519_shared, 32);
-            crypto_generichash_update(&st, client_pk, 32);
-            crypto_generichash_update(&st, srv_pk, 32);
-            crypto_generichash_final(&st, hash, 64);
-            memcpy(tx_key, hash, 32); memcpy(rx_key, hash + 32, 32);
-        }
-        rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes); if (!rx_ct) return -1;
-        nonce_next(&nonce_rx, nonce_buf);
-        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt1, &pt1_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) { free(rx_ct); return -1; }
-        free(rx_ct); rx_ct = NULL;
-        if (pt1_len != sizeof(pt1)) return -1;
-        memcpy(pid, pt1 + off, 32); off += 32;
-        memcpy(A_c, pt1 + off, 32); off += 32;
-        memcpy(s_c, pt1 + off, 32); off += 32;
-        memcpy(nonce_c, pt1 + off, 32); off += 32;
-        memcpy(eph_c, pt1 + off, 32); off += 32;
-        memcpy(c_prime, pt1 + off, 32); off += 32;
-        memcpy(rerand_A, pt1 + off, 32); off += 32;
-        memcpy(rerand_s, pt1 + off, 32); off += 32;
-        for (i = 0; i < ALLOWED_ROLE_COUNT; i++) { memcpy(or_proof[i], pt1 + off, 96); off += 96; }
+        if (recv_all(cfd, payload1, sizeof(payload1), &recv_bytes) != 0) return -1;
+        memcpy(pid,      payload1 + off, 32); off += 32;
+        memcpy(A_c,      payload1 + off, 32); off += 32;
+        memcpy(s_c,      payload1 + off, 32); off += 32;
+        memcpy(nonce_c,  payload1 + off, 32); off += 32;
+        memcpy(eph_c,    payload1 + off, 32); off += 32;
+        memcpy(c_prime,  payload1 + off, 32); off += 32;
+        memcpy(rerand_A, payload1 + off, 32); off += 32;
+        memcpy(rerand_s, payload1 + off, 32); off += 32;
+        for (i = 0; i < ALLOWED_ROLE_COUNT; i++) { memcpy(or_proof[i], payload1 + off, 96); off += 96; }
+
         if (check_point(A_c, "A_c") != 0 || check_point(eph_c, "eph_c") != 0 || check_point(c_prime, "c_prime") != 0 || check_point(rerand_A, "rerand_A") != 0) return -1;
         for (i = 0; i < ALLOWED_ROLE_COUNT; i++) if (check_point(or_proof[i], "or_A") != 0) return -1;
-        if (lookup_record_by_pid(*reg, *reg_n, pid, nonce_c, eph_c, server_pub, &record) != 0) { fprintf(stderr, "Server[AUTH]: unknown pid\n"); return -1; }
+        if (lookup_record_by_pid(*reg, *reg_n, pid, nonce_c, eph_c, server_pub, &record) != 0) { fprintf(stderr, "Server[AUTH]: unknown pid\n");
+            return -1; }
         if (schnorr_verify_auth(pid, record.pub, A_c, s_c, nonce_c, eph_c) != 0) return -1;
         if (verify_role_rerandomization(record.role_commitment, c_prime, rerand_A, rerand_s, pid, nonce_c, eph_c) != 0) return -1;
         if (verify_role_set_membership(c_prime, or_proof, pid, nonce_c, eph_c) != 0) return -1;
-        randombytes_buf(nonce_s, 32); crypto_core_ristretto255_scalar_random(eph_s_secret); crypto_scalarmult_ristretto255_base(eph_s, eph_s_secret); schnorr_prove_server(A_s, s_s, server_sk, server_pub, nonce_s, eph_s);
+
+        randombytes_buf(nonce_s, 32);
+        crypto_core_ristretto255_scalar_random(eph_s_secret);
+        crypto_scalarmult_ristretto255_base(eph_s, eph_s_secret);
+        schnorr_prove_server(A_s, s_s, server_sk, server_pub, nonce_s, eph_s);
         if (derive_session_key(session_key, eph_s_secret, eph_c, nonce_c, nonce_s, pid, eph_c, eph_s) != 0) return -1;
         kc_transcript_hash(th, pid, A_c, s_c, nonce_c, eph_c, server_pub, A_s, s_s, nonce_s, eph_s);
-        derive_kc_keys(k_s2c, k_c2s, session_key, th); hmac_tag(tag_s, k_s2c, "server finished", th);
-        memcpy(payload2 + 0, server_pub, 32); memcpy(payload2 + 32, A_s, 32); memcpy(payload2 + 64, s_s, 32); memcpy(payload2 + 96, nonce_s, 32); memcpy(payload2 + 128, eph_s, 32); memcpy(payload2 + 160, tag_s, 32);
-        nonce_next(&nonce_tx, nonce_buf); crypto_aead_chacha20poly1305_ietf_encrypt(ct2, &ct2_len, payload2, sizeof payload2, NULL, 0, NULL, nonce_buf, tx_key);
-        if (send_u32_le(cfd, (uint32_t)ct2_len, &sent) != 0) return -1; if (send_all(cfd, ct2, (size_t)ct2_len, &sent) != 0) return -1;
-        rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes); if (!rx_ct) return -1;
-        nonce_next(&nonce_rx, nonce_buf); if (crypto_aead_chacha20poly1305_ietf_decrypt(pt3, &pt3_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) { free(rx_ct); return -1; }
-        free(rx_ct); if (pt3_len != 32) return -1;
-        hmac_tag(expected_tag_c, k_c2s, "client finished", th); if (sodium_memcmp(expected_tag_c, pt3, 32) != 0) return -1;
+        derive_kc_keys(k_s2c, k_c2s, session_key, th);
+        hmac_tag(tag_s, k_s2c, "server finished", th);
+
+        memcpy(payload2 + 0,   server_pub, 32);
+        memcpy(payload2 + 32,  A_s,        32);
+        memcpy(payload2 + 64,  s_s,        32);
+        memcpy(payload2 + 96,  nonce_s,    32);
+        memcpy(payload2 + 128, eph_s,      32);
+        memcpy(payload2 + 160, tag_s,      32);
+        if (send_all(cfd, payload2, sizeof(payload2), &sent) != 0) return -1;
+
+        if (recv_all(cfd, tag_c, 32, &recv_bytes) != 0) return -1;
+        hmac_tag(expected_tag_c, k_c2s, "client finished", th);
+        if (sodium_memcmp(expected_tag_c, tag_c, 32) != 0) return -1;
         printf("Server[AUTH]: pid-auth KC=OK\n");
         printf("Server[ONLINE]: one-shot session completed\n");
         print_server_metrics(peer, start_ms, sent, recv_bytes);
