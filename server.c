@@ -22,6 +22,7 @@
 #define REGISTRY_BIN     "/var/lib/iot-auth/server/registry.bin"
 #define REGISTRY_BAK     "/var/lib/iot-auth/server/registry.bak"
 #define SERVER_SK_FILE   "/var/lib/iot-auth/server/server_sk.bin"
+#define REPLAY_CACHE_BIN "/var/lib/iot-auth/server/replay_cache.bin"
 
 #define SETUP_CHALLENGE_LEN 16
 #define MAX_ENCRYPTED_PAYLOAD 4096
@@ -37,10 +38,15 @@
 
 #define T_SETUP        "setup_client_schnorr_v1"
 #define T_SETUP_SERVER "setup_server_schnorr_v1"
-#define T_CLIENT       "client_schnorr_v1"
 #define T_SERVER       "server_schnorr_v1"
-#define T_KC           "kc_v1"
-#define T_ATTR_ROLE    "client_attr_role_v1"
+#define T_PID          "iot-auth/pid/v1"
+#define T_CLIENT_V2    "client_schnorr_v2"
+#define T_KC_V2        "kc_v2"
+#define T_ROLE_SET     "client_role_set_v1"
+#define T_ROLE_RERAND  "client_role_rerand_v1"
+
+static const uint64_t ALLOWED_ROLES[] = {1ULL, 2ULL};
+#define ALLOWED_ROLE_COUNT (sizeof(ALLOWED_ROLES) / sizeof(ALLOWED_ROLES[0]))
 
 typedef struct { uint64_t count; } nonce_ctr_t;
 typedef struct { uint8_t buf[4096]; size_t len; } transcript_t;
@@ -48,7 +54,6 @@ typedef struct {
     uint8_t id[32];
     uint8_t pub[32];
     uint8_t role_commitment[32];
-    uint64_t role_code;
 } reg_entry_t;
 typedef struct {
     int enabled;
@@ -262,6 +267,100 @@ static void hash_to_point(const char *label, uint8_t out[32]) {
 
 static void attr_h(uint8_t out[32]) { hash_to_point("iot-auth/attr-h/v1", out); }
 
+static void scalar_zero(uint8_t s[32]) { memset(s, 0, 32); }
+
+static void scalar_from_u64(uint64_t v, uint8_t out[32]) {
+    scalar_zero(out);
+    le64_store(out, v);
+}
+
+static void compute_pid(uint8_t pid[32], const uint8_t device_pub[32], const uint8_t nonce_c[32],
+                        const uint8_t eph_c[32], const uint8_t server_pub[32]) {
+    crypto_hash_sha256_state st;
+    uint8_t dlen[4];
+    uint32_t n = (uint32_t)strlen(T_PID);
+    dlen[0] = (uint8_t)n; dlen[1] = (uint8_t)(n >> 8); dlen[2] = (uint8_t)(n >> 16); dlen[3] = (uint8_t)(n >> 24);
+    crypto_hash_sha256_init(&st);
+    crypto_hash_sha256_update(&st, dlen, 4);
+    crypto_hash_sha256_update(&st, (const unsigned char *)T_PID, n);
+    crypto_hash_sha256_update(&st, device_pub, 32);
+    crypto_hash_sha256_update(&st, nonce_c, 32);
+    crypto_hash_sha256_update(&st, eph_c, 32);
+    crypto_hash_sha256_update(&st, server_pub, 32);
+    crypto_hash_sha256_final(&st, pid);
+}
+
+static int verify_role_rerandomization(const uint8_t stored_c[32], const uint8_t c_prime[32],
+                                       const uint8_t A[32], const uint8_t s[32], const uint8_t pid[32],
+                                       const uint8_t nonce_c[32], const uint8_t eph_c[32]) {
+    uint8_t h[32], diff[32], c[32], left[32], cc[32], right[32];
+    transcript_t tr;
+    attr_h(h);
+    crypto_core_ristretto255_sub(diff, c_prime, stored_c);
+    tr_init(&tr, T_ROLE_RERAND);
+    tr_append(&tr, "pid", pid, 32);
+    tr_append(&tr, "nonce_c", nonce_c, 32);
+    tr_append(&tr, "eph_c", eph_c, 32);
+    tr_append(&tr, "stored_c", stored_c, 32);
+    tr_append(&tr, "c_prime", c_prime, 32);
+    tr_append(&tr, "a", A, 32);
+    tr_challenge_scalar(c, &tr);
+    if (crypto_scalarmult_ristretto255(left, s, h) != 0) return -1;
+    if (crypto_scalarmult_ristretto255(cc, c, diff) != 0) return -1;
+    crypto_core_ristretto255_add(right, A, cc);
+    return sodium_memcmp(left, right, 32) == 0 ? 0 : -1;
+}
+
+static int verify_role_set_membership(const uint8_t c_prime[32], const uint8_t proof[][96],
+                                      const uint8_t pid[32], const uint8_t nonce_c[32],
+                                      const uint8_t eph_c[32]) {
+    uint8_t h[32], master_c[32], sum[32], role_scalar[32], g_r[32], y_i[32], left[32], yc[32], right[32];
+    size_t i; transcript_t tr;
+    attr_h(h);
+    for (i = 0; i < ALLOWED_ROLE_COUNT; i++) if (crypto_core_ristretto255_is_valid_point(proof[i]) != 1) return -1;
+    tr_init(&tr, T_ROLE_SET);
+    tr_append(&tr, "pid", pid, 32);
+    tr_append(&tr, "nonce_c", nonce_c, 32);
+    tr_append(&tr, "eph_c", eph_c, 32);
+    tr_append(&tr, "c_prime", c_prime, 32);
+    for (i = 0; i < ALLOWED_ROLE_COUNT; i++) {
+        char label[16]; uint8_t le[8];
+        snprintf(label, sizeof label, "r_%zu", i);
+        le64_store(le, ALLOWED_ROLES[i]);
+        tr_append(&tr, label, le, 8);
+    }
+    for (i = 0; i < ALLOWED_ROLE_COUNT; i++) {
+        char label[16];
+        snprintf(label, sizeof label, "A_%zu", i);
+        tr_append(&tr, label, proof[i], 32);
+    }
+    tr_challenge_scalar(master_c, &tr);
+    scalar_zero(sum);
+    for (i = 0; i < ALLOWED_ROLE_COUNT; i++) crypto_core_ristretto255_scalar_add(sum, sum, proof[i] + 32);
+    if (sodium_memcmp(sum, master_c, 32) != 0) return -1;
+    for (i = 0; i < ALLOWED_ROLE_COUNT; i++) {
+        scalar_from_u64(ALLOWED_ROLES[i], role_scalar);
+        crypto_scalarmult_ristretto255_base(g_r, role_scalar);
+        crypto_core_ristretto255_sub(y_i, c_prime, g_r);
+        if (crypto_scalarmult_ristretto255(left, proof[i] + 64, h) != 0) return -1;
+        if (crypto_scalarmult_ristretto255(yc, proof[i] + 32, y_i) != 0) return -1;
+        crypto_core_ristretto255_add(right, proof[i], yc);
+        if (sodium_memcmp(left, right, 32) != 0) return -1;
+    }
+    return 0;
+}
+
+static int lookup_record_by_pid(const reg_entry_t *arr, size_t n, const uint8_t pid[32],
+                                const uint8_t nonce_c[32], const uint8_t eph_c[32],
+                                const uint8_t server_pub[32], reg_entry_t *out) {
+    size_t i; uint8_t cand[32];
+    for (i = 0; i < n; i++) {
+        compute_pid(cand, arr[i].pub, nonce_c, eph_c, server_pub);
+        if (sodium_memcmp(cand, pid, 32) == 0) { if (out) *out = arr[i]; return 0; }
+    }
+    return -1;
+}
+
 static int load_or_create_server_sk(uint8_t out[32]) {
     if (file_exists(SERVER_SK_FILE)) return read_file_32(SERVER_SK_FILE, out);
     crypto_core_ristretto255_scalar_random(out);
@@ -271,70 +370,30 @@ static int load_or_create_server_sk(uint8_t out[32]) {
 static int save_registry(const reg_entry_t *arr, size_t n) {
     FILE *f;
     char tmp[256];
-    uint8_t le[8];
-
     if (file_exists(REGISTRY_BIN)) rename(REGISTRY_BIN, REGISTRY_BAK);
     snprintf(tmp, sizeof tmp, "%s.tmp", REGISTRY_BIN);
     f = fopen(tmp, "wb");
     if (!f) return -1;
-
     for (size_t i = 0; i < n; i++) {
-        le64_store(le, arr[i].role_code);
-        if (fwrite(arr[i].id, 1, 32, f) != 32 ||
-            fwrite(arr[i].pub, 1, 32, f) != 32 ||
-            fwrite(arr[i].role_commitment, 1, 32, f) != 32 ||
-            fwrite(le, 1, 8, f) != 8) {
-            fclose(f);
-            return -1;
-        }
+        if (fwrite(arr[i].id, 1, 32, f) != 32 || fwrite(arr[i].pub, 1, 32, f) != 32 || fwrite(arr[i].role_commitment, 1, 32, f) != 32) { fclose(f); return -1; }
     }
-
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    chmod(tmp, 0600);
-    return rename(tmp, REGISTRY_BIN);
+    fflush(f); fsync(fileno(f)); fclose(f); chmod(tmp, 0600); return rename(tmp, REGISTRY_BIN);
 }
 
 static int load_registry(reg_entry_t **out, size_t *out_n) {
-    FILE *f;
-    long sz;
-    size_t n;
-
-    *out = NULL;
-    *out_n = 0;
+    FILE *f; long sz; size_t n;
+    *out = NULL; *out_n = 0;
     if (!file_exists(REGISTRY_BIN)) return 0;
-
-    f = fopen(REGISTRY_BIN, "rb");
-    if (!f) return -1;
+    f = fopen(REGISTRY_BIN, "rb"); if (!f) return -1;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
-    sz = ftell(f);
-    if (sz < 0 || (sz % 104) != 0) { fclose(f); return -1; }
+    sz = ftell(f); if (sz < 0 || (sz % 96) != 0) { fclose(f); return -1; }
     if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
-
-    n = (size_t)sz / 104;
-    if (n == 0) { fclose(f); return 0; }
-
-    *out = calloc(n, sizeof(reg_entry_t));
-    if (!*out) { fclose(f); return -1; }
-
+    n = (size_t)sz / 96; if (n == 0) { fclose(f); return 0; }
+    *out = calloc(n, sizeof(reg_entry_t)); if (!*out) { fclose(f); return -1; }
     for (size_t i = 0; i < n; i++) {
-        uint8_t le[8];
-        if (fread((*out)[i].id, 1, 32, f) != 32 ||
-            fread((*out)[i].pub, 1, 32, f) != 32 ||
-            fread((*out)[i].role_commitment, 1, 32, f) != 32 ||
-            fread(le, 1, 8, f) != 8) {
-            fclose(f);
-            free(*out);
-            *out = NULL;
-            return -1;
-        }
-        (*out)[i].role_code = le64_load(le);
+        if (fread((*out)[i].id, 1, 32, f) != 32 || fread((*out)[i].pub, 1, 32, f) != 32 || fread((*out)[i].role_commitment, 1, 32, f) != 32) { fclose(f); free(*out); *out = NULL; return -1; }
     }
-
-    fclose(f);
-    *out_n = n;
-    return 0;
+    fclose(f); *out_n = n; return 0;
 }
 
 static int reg_lookup_record(const reg_entry_t *arr, size_t n, const uint8_t id[32], reg_entry_t *out) {
@@ -348,31 +407,18 @@ static int reg_lookup_record(const reg_entry_t *arr, size_t n, const uint8_t id[
 }
 
 static int reg_upsert(reg_entry_t **arrp, size_t *np, const uint8_t id[32], const uint8_t pub[32],
-                      const uint8_t role_commitment[32], uint64_t role_code) {
-    reg_entry_t *arr = *arrp;
-    size_t n = *np;
-
+                      const uint8_t role_commitment[32]) {
+    reg_entry_t *arr = *arrp; size_t n = *np;
     for (size_t i = 0; i < n; i++) {
         if (sodium_memcmp(arr[i].id, id, 32) == 0) {
             if (sodium_memcmp(arr[i].pub, pub, 32) != 0) return -1;
             if (sodium_memcmp(arr[i].role_commitment, role_commitment, 32) != 0) return -1;
-            if (arr[i].role_code != role_code) return -1;
             return 0;
         }
     }
-
-    arr = realloc(arr, (n + 1) * sizeof(reg_entry_t));
-    if (!arr) return -1;
-
-    memcpy(arr[n].id, id, 32);
-    memcpy(arr[n].pub, pub, 32);
-    memcpy(arr[n].role_commitment, role_commitment, 32);
-    arr[n].role_code = role_code;
-    n++;
-
-    *arrp = arr;
-    *np = n;
-    return save_registry(arr, n) == 0 ? 1 : -1;
+    arr = realloc(arr, (n + 1) * sizeof(reg_entry_t)); if (!arr) return -1;
+    memcpy(arr[n].id, id, 32); memcpy(arr[n].pub, pub, 32); memcpy(arr[n].role_commitment, role_commitment, 32); n++;
+    *arrp = arr; *np = n; return save_registry(arr, n) == 0 ? 1 : -1;
 }
 
 static int allows_setup(const pairing_policy_t *pol, const char *provided, size_t provided_len) {
@@ -434,19 +480,17 @@ static void schnorr_prove_setup_server(uint8_t A[32], uint8_t s[32], const uint8
     crypto_core_ristretto255_scalar_add(s, r, cx);
 }
 
-static int schnorr_verify_auth(const uint8_t device_id[32], const uint8_t expected_pub[32], const uint8_t A[32], const uint8_t s[32],
+static int schnorr_verify_auth(const uint8_t pid[32], const uint8_t expected_pub[32], const uint8_t A[32], const uint8_t s[32],
                                const uint8_t nonce_c[32], const uint8_t eph_c[32]) {
     uint8_t c[32], left[32], cx[32], right[32];
     transcript_t tr;
-
-    tr_init(&tr, T_CLIENT);
-    tr_append(&tr, "device_id", device_id, 32);
+    tr_init(&tr, T_CLIENT_V2);
+    tr_append(&tr, "pid", pid, 32);
     tr_append(&tr, "pubkey", expected_pub, 32);
     tr_append(&tr, "a", A, 32);
     tr_append(&tr, "nonce_c", nonce_c, 32);
     tr_append(&tr, "eph_c", eph_c, 32);
     tr_challenge_scalar(c, &tr);
-
     crypto_scalarmult_ristretto255_base(left, s);
     if (crypto_scalarmult_ristretto255(cx, c, expected_pub) != 0) return -1;
     crypto_core_ristretto255_add(right, A, cx);
@@ -470,29 +514,6 @@ static void schnorr_prove_server(uint8_t A[32], uint8_t s[32], const uint8_t ser
 
     crypto_core_ristretto255_scalar_mul(cx, c, server_sk);
     crypto_core_ristretto255_scalar_add(s, r, cx);
-}
-
-static int verify_role_commitment_opening(const uint8_t commitment[32], const uint8_t A[32], const uint8_t s_attr[32], const uint8_t s_blind[32],
-                                          const uint8_t device_id[32], const uint8_t nonce_c[32], const uint8_t eph_c[32]) {
-    uint8_t c[32], h[32], left1[32], left2[32], left[32], cc[32], right[32];
-    transcript_t tr;
-
-    attr_h(h);
-    tr_init(&tr, T_ATTR_ROLE);
-    tr_append(&tr, "device_id", device_id, 32);
-    tr_append(&tr, "commitment", commitment, 32);
-    tr_append(&tr, "a", A, 32);
-    tr_append(&tr, "nonce_c", nonce_c, 32);
-    tr_append(&tr, "eph_c", eph_c, 32);
-    tr_challenge_scalar(c, &tr);
-
-    crypto_scalarmult_ristretto255_base(left1, s_attr);
-    if (crypto_scalarmult_ristretto255(left2, s_blind, h) != 0) return -1;
-    crypto_core_ristretto255_add(left, left1, left2);
-
-    if (crypto_scalarmult_ristretto255(cc, c, commitment) != 0) return -1;
-    crypto_core_ristretto255_add(right, A, cc);
-    return sodium_memcmp(left, right, 32) == 0 ? 0 : -1;
 }
 
 static void hmac_sha256(uint8_t out[32], const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len) {
@@ -527,36 +548,30 @@ static void hkdf_expand(uint8_t *out, size_t out_len, const uint8_t prk[32], con
 }
 
 static int derive_session_key(uint8_t key[32], const uint8_t eph_secret[32], const uint8_t eph_peer[32],
-                              const uint8_t nonce_c[32], const uint8_t nonce_s[32], const uint8_t device_id[32],
-                              const uint8_t eph_c[32], const uint8_t eph_s[32], const uint8_t x25519_shared[32]) {
-    uint8_t shared[32], salt[64], info[11 + 32 + 32 + 32 + 32], prk[32];
+                              const uint8_t nonce_c[32], const uint8_t nonce_s[32], const uint8_t pid[32],
+                              const uint8_t eph_c[32], const uint8_t eph_s[32]) {
+    uint8_t shared[32], salt[64], info[14 + 32 + 32 + 32], prk[32];
     size_t off = 0;
-
     if (crypto_scalarmult_ristretto255(shared, eph_secret, eph_peer) != 0) return -1;
-
     memcpy(salt, nonce_c, 32);
     memcpy(salt + 32, nonce_s, 32);
-    memcpy(info + off, "session key", 11); off += 11;
-    memcpy(info + off, device_id, 32); off += 32;
+    memcpy(info + off, "session key v2", 14); off += 14;
+    memcpy(info + off, pid, 32); off += 32;
     memcpy(info + off, eph_c, 32); off += 32;
     memcpy(info + off, eph_s, 32); off += 32;
-    memcpy(info + off, x25519_shared, 32); off += 32;
-
     hkdf_extract(prk, salt, sizeof salt, shared, sizeof shared);
     hkdf_expand(key, 32, prk, info, off);
-
     sodium_memzero(shared, sizeof shared);
     sodium_memzero(prk, sizeof prk);
     return 0;
 }
 
-static void kc_transcript_hash(uint8_t th[32], const uint8_t device_id[32], const uint8_t a_c[32], const uint8_t s_c[32],
+static void kc_transcript_hash(uint8_t th[32], const uint8_t pid[32], const uint8_t a_c[32], const uint8_t s_c[32],
                                const uint8_t nonce_c[32], const uint8_t eph_c[32], const uint8_t server_pub[32],
                                const uint8_t a_s[32], const uint8_t s_s[32], const uint8_t nonce_s[32], const uint8_t eph_s[32]) {
     transcript_t tr;
-
-    tr_init(&tr, T_KC);
-    tr_append(&tr, "device_id", device_id, 32);
+    tr_init(&tr, T_KC_V2);
+    tr_append(&tr, "pid", pid, 32);
     tr_append(&tr, "a_c", a_c, 32);
     tr_append(&tr, "s_c", s_c, 32);
     tr_append(&tr, "nonce_c", nonce_c, 32);
@@ -566,7 +581,6 @@ static void kc_transcript_hash(uint8_t th[32], const uint8_t device_id[32], cons
     tr_append(&tr, "s_s", s_s, 32);
     tr_append(&tr, "nonce_s", nonce_s, 32);
     tr_append(&tr, "eph_s", eph_s, 32);
-
     crypto_hash_sha256(th, tr.buf, (unsigned long long)tr.len);
 }
 
@@ -680,7 +694,7 @@ static int handle_client(int cfd, const uint8_t server_sk[32], const uint8_t ser
             return -1;
         }
 
-        upsert = reg_upsert(reg, reg_n, device_id, device_pub, role_commitment, 1);
+        upsert = reg_upsert(reg, reg_n, device_id, device_pub, role_commitment);
         if (upsert < 0) return -1;
 
         if (send_all(cfd, &ack, 1, &sent) != 0) return -1;
@@ -694,24 +708,18 @@ static int handle_client(int cfd, const uint8_t server_sk[32], const uint8_t ser
     if (msg == MSG_AUTH_V2) {
         uint8_t client_pk[32], srv_pk[32], srv_sk_x[32], x25519_shared[32], hash[64], rx_key[32], tx_key[32];
         nonce_ctr_t nonce_rx = {0}, nonce_tx = {0};
-        uint32_t rx_len;
-        uint8_t *rx_ct = NULL;
-        uint8_t pt1[288], nonce_buf[12];
-        unsigned long long pt1_len;
-        uint8_t device_id[32], A_c[32], s_c[32], nonce_c[32], eph_c[32], role_commitment[32], attr_A[32], attr_s_attr[32], attr_s_blind[32];
-        reg_entry_t record;
-        uint8_t nonce_s[32], eph_s_secret[32], eph_s[32], A_s[32], s_s[32], session_key[32], th[32], k_s2c[32], k_c2s[32], tag_s[32], expected_tag_c[32], payload2[192], pt3[32];
-        unsigned long long pt3_len, ct2_len;
-        uint8_t ct2[192 + crypto_aead_chacha20poly1305_IETF_ABYTES];
-        char did_hex[65];
+        uint32_t rx_len; uint8_t *rx_ct = NULL; uint8_t nonce_buf[12];
+        uint8_t pt1[256 + 96 * ALLOWED_ROLE_COUNT]; unsigned long long pt1_len;
+        uint8_t pid[32], A_c[32], s_c[32], nonce_c[32], eph_c[32], c_prime[32], rerand_A[32], rerand_s[32];
+        uint8_t or_proof[ALLOWED_ROLE_COUNT][96];
+        reg_entry_t record; uint8_t nonce_s[32], eph_s_secret[32], eph_s[32], A_s[32], s_s[32], session_key[32], th[32], k_s2c[32], k_c2s[32], tag_s[32], expected_tag_c[32], payload2[192], pt3[32];
+        unsigned long long pt3_len, ct2_len; uint8_t ct2[192 + crypto_aead_chacha20poly1305_IETF_ABYTES];
+        size_t off = 0, i;
 
         if (recv_all(cfd, client_pk, 32, &recv_bytes) != 0) return -1;
-
         crypto_kx_keypair(srv_pk, srv_sk_x);
         if (send_all(cfd, srv_pk, 32, &sent) != 0) return -1;
-
         if (crypto_scalarmult(x25519_shared, srv_sk_x, client_pk) != 0) return -1;
-
         {
             crypto_generichash_state st;
             crypto_generichash_init(&st, NULL, 0, 64);
@@ -719,91 +727,41 @@ static int handle_client(int cfd, const uint8_t server_sk[32], const uint8_t ser
             crypto_generichash_update(&st, client_pk, 32);
             crypto_generichash_update(&st, srv_pk, 32);
             crypto_generichash_final(&st, hash, 64);
-            memcpy(tx_key, hash, 32);
-            memcpy(rx_key, hash + 32, 32);
+            memcpy(tx_key, hash, 32); memcpy(rx_key, hash + 32, 32);
         }
-
-        rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes);
-        if (!rx_ct) return -1;
-
+        rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes); if (!rx_ct) return -1;
         nonce_next(&nonce_rx, nonce_buf);
-        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt1, &pt1_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) {
-            free(rx_ct);
-            return -1;
-        }
-        free(rx_ct);
-        rx_ct = NULL;
-
-        if (pt1_len != 288) return -1;
-
-        memcpy(device_id,       pt1 + 0,   32);
-        memcpy(A_c,             pt1 + 32,  32);
-        memcpy(s_c,             pt1 + 64,  32);
-        memcpy(nonce_c,         pt1 + 96,  32);
-        memcpy(eph_c,           pt1 + 128, 32);
-        memcpy(role_commitment, pt1 + 160, 32);
-        memcpy(attr_A,          pt1 + 192, 32);
-        memcpy(attr_s_attr,     pt1 + 224, 32);
-        memcpy(attr_s_blind,    pt1 + 256, 32);
-
-        if (check_point(A_c, "A_c") != 0 ||
-            check_point(eph_c, "eph_c") != 0 ||
-            check_point(role_commitment, "role_commitment") != 0 ||
-            check_point(attr_A, "attr_A") != 0) {
-            return -1;
-        }
-
-        if (reg_lookup_record(*reg, *reg_n, device_id, &record) != 0) {
-            fprintf(stderr, "Server[AUTH]: unknown device\n");
-            return -1;
-        }
-
-        if (sodium_memcmp(record.role_commitment, role_commitment, 32) != 0 || record.role_code != 1) return -1;
-        if (schnorr_verify_auth(device_id, record.pub, A_c, s_c, nonce_c, eph_c) != 0) return -1;
-        if (verify_role_commitment_opening(role_commitment, attr_A, attr_s_attr, attr_s_blind, device_id, nonce_c, eph_c) != 0) return -1;
-
-        randombytes_buf(nonce_s, 32);
-        crypto_core_ristretto255_scalar_random(eph_s_secret);
-        crypto_scalarmult_ristretto255_base(eph_s, eph_s_secret);
-        schnorr_prove_server(A_s, s_s, server_sk, server_pub, nonce_s, eph_s);
-
-        if (derive_session_key(session_key, eph_s_secret, eph_c, nonce_c, nonce_s, device_id, eph_c, eph_s, x25519_shared) != 0) return -1;
-
-        kc_transcript_hash(th, device_id, A_c, s_c, nonce_c, eph_c, server_pub, A_s, s_s, nonce_s, eph_s);
-        derive_kc_keys(k_s2c, k_c2s, session_key, th);
-        hmac_tag(tag_s, k_s2c, "server finished", th);
-
-        memcpy(payload2 + 0,   server_pub, 32);
-        memcpy(payload2 + 32,  A_s,        32);
-        memcpy(payload2 + 64,  s_s,        32);
-        memcpy(payload2 + 96,  nonce_s,    32);
-        memcpy(payload2 + 128, eph_s,      32);
-        memcpy(payload2 + 160, tag_s,      32);
-
-        nonce_next(&nonce_tx, nonce_buf);
-        crypto_aead_chacha20poly1305_ietf_encrypt(ct2, &ct2_len, payload2, sizeof payload2, NULL, 0, NULL, nonce_buf, tx_key);
-
-        if (send_u32_le(cfd, (uint32_t)ct2_len, &sent) != 0) return -1;
-        if (send_all(cfd, ct2, (size_t)ct2_len, &sent) != 0) return -1;
-
-        rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes);
-        if (!rx_ct) return -1;
-
-        nonce_next(&nonce_rx, nonce_buf);
-        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt3, &pt3_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) {
-            free(rx_ct);
-            return -1;
-        }
-        free(rx_ct);
-
-        if (pt3_len != 32) return -1;
-
-        hmac_tag(expected_tag_c, k_c2s, "client finished", th);
-        if (sodium_memcmp(expected_tag_c, pt3, 32) != 0) return -1;
-
-        bin2hex_lower(device_id, 32, did_hex, sizeof did_hex);
-        printf("Server[AUTH]: device_id=%s KC=OK\n", did_hex);
-        printf("Server[ONLINE]: one-shot session completed for %s\n", did_hex);
+        if (crypto_aead_chacha20poly1305_ietf_decrypt(pt1, &pt1_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) { free(rx_ct); return -1; }
+        free(rx_ct); rx_ct = NULL;
+        if (pt1_len != sizeof(pt1)) return -1;
+        memcpy(pid, pt1 + off, 32); off += 32;
+        memcpy(A_c, pt1 + off, 32); off += 32;
+        memcpy(s_c, pt1 + off, 32); off += 32;
+        memcpy(nonce_c, pt1 + off, 32); off += 32;
+        memcpy(eph_c, pt1 + off, 32); off += 32;
+        memcpy(c_prime, pt1 + off, 32); off += 32;
+        memcpy(rerand_A, pt1 + off, 32); off += 32;
+        memcpy(rerand_s, pt1 + off, 32); off += 32;
+        for (i = 0; i < ALLOWED_ROLE_COUNT; i++) { memcpy(or_proof[i], pt1 + off, 96); off += 96; }
+        if (check_point(A_c, "A_c") != 0 || check_point(eph_c, "eph_c") != 0 || check_point(c_prime, "c_prime") != 0 || check_point(rerand_A, "rerand_A") != 0) return -1;
+        for (i = 0; i < ALLOWED_ROLE_COUNT; i++) if (check_point(or_proof[i], "or_A") != 0) return -1;
+        if (lookup_record_by_pid(*reg, *reg_n, pid, nonce_c, eph_c, server_pub, &record) != 0) { fprintf(stderr, "Server[AUTH]: unknown pid\n"); return -1; }
+        if (schnorr_verify_auth(pid, record.pub, A_c, s_c, nonce_c, eph_c) != 0) return -1;
+        if (verify_role_rerandomization(record.role_commitment, c_prime, rerand_A, rerand_s, pid, nonce_c, eph_c) != 0) return -1;
+        if (verify_role_set_membership(c_prime, or_proof, pid, nonce_c, eph_c) != 0) return -1;
+        randombytes_buf(nonce_s, 32); crypto_core_ristretto255_scalar_random(eph_s_secret); crypto_scalarmult_ristretto255_base(eph_s, eph_s_secret); schnorr_prove_server(A_s, s_s, server_sk, server_pub, nonce_s, eph_s);
+        if (derive_session_key(session_key, eph_s_secret, eph_c, nonce_c, nonce_s, pid, eph_c, eph_s) != 0) return -1;
+        kc_transcript_hash(th, pid, A_c, s_c, nonce_c, eph_c, server_pub, A_s, s_s, nonce_s, eph_s);
+        derive_kc_keys(k_s2c, k_c2s, session_key, th); hmac_tag(tag_s, k_s2c, "server finished", th);
+        memcpy(payload2 + 0, server_pub, 32); memcpy(payload2 + 32, A_s, 32); memcpy(payload2 + 64, s_s, 32); memcpy(payload2 + 96, nonce_s, 32); memcpy(payload2 + 128, eph_s, 32); memcpy(payload2 + 160, tag_s, 32);
+        nonce_next(&nonce_tx, nonce_buf); crypto_aead_chacha20poly1305_ietf_encrypt(ct2, &ct2_len, payload2, sizeof payload2, NULL, 0, NULL, nonce_buf, tx_key);
+        if (send_u32_le(cfd, (uint32_t)ct2_len, &sent) != 0) return -1; if (send_all(cfd, ct2, (size_t)ct2_len, &sent) != 0) return -1;
+        rx_ct = recv_encrypted_blob(cfd, &rx_len, &recv_bytes); if (!rx_ct) return -1;
+        nonce_next(&nonce_rx, nonce_buf); if (crypto_aead_chacha20poly1305_ietf_decrypt(pt3, &pt3_len, NULL, rx_ct, rx_len, NULL, 0, nonce_buf, rx_key) != 0) { free(rx_ct); return -1; }
+        free(rx_ct); if (pt3_len != 32) return -1;
+        hmac_tag(expected_tag_c, k_c2s, "client finished", th); if (sodium_memcmp(expected_tag_c, pt3, 32) != 0) return -1;
+        printf("Server[AUTH]: pid-auth KC=OK\n");
+        printf("Server[ONLINE]: one-shot session completed\n");
         print_server_metrics(peer, start_ms, sent, recv_bytes);
         return 0;
     }
