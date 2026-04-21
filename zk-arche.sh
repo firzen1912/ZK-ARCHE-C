@@ -13,28 +13,26 @@ CLIENT_BIN="${PROJECT_ROOT}/c_client"
 
 CLIENT_DEVICE_ROOT="${CLIENT_STATE_DIR}/device_root.bin"
 CLIENT_SERVER_PUB="${CLIENT_STATE_DIR}/server_pub.bin"
-CLIENT_DEVICE_CERT="${CLIENT_STATE_DIR}/device_cert.pem"
-CLIENT_DEVICE_KEY="${CLIENT_STATE_DIR}/device_key.pem"
-CLIENT_CA_CERT="${CLIENT_STATE_DIR}/ca_cert.pem"
+CLIENT_ROLE_CRED="${CLIENT_STATE_DIR}/role_cred.bin"
 
 SERVER_SK_FILE="${SERVER_STATE_DIR}/server_sk.bin"
 SERVER_PUB_HEX_FILE="${SERVER_STATE_DIR}/server_pub.hex"
 SERVER_REGISTRY="${SERVER_STATE_DIR}/registry.bin"
 SERVER_REGISTRY_BAK="${SERVER_STATE_DIR}/registry.bak"
 SERVER_REPLAY_CACHE="${SERVER_STATE_DIR}/replay_cache.bin"
+SERVER_OFFLINE_COUNTERS="${SERVER_STATE_DIR}/offline_counters.bin"
 
-SERVER_CERT="${SERVER_STATE_DIR}/server_cert.pem"
-SERVER_CERT_KEY="${SERVER_STATE_DIR}/server_cert_key.pem"
-SERVER_CA_CERT="${SERVER_STATE_DIR}/ca_cert.pem"
-SERVER_CA_KEY="${SERVER_STATE_DIR}/ca_key.pem"
+OFFLINE_PROOF_FILE="${GENERATED_DIR}/offline_proof.bin"
+OFFLINE_REQUEST_FILE="${GENERATED_DIR}/offline_request.bin"
+DEFAULT_OFFLINE_AUDIENCE="gateway-A"
+DEFAULT_OFFLINE_SCOPE="telemetry_upload"
+DEFAULT_OFFLINE_EXPIRES_IN=120
+CLIENT_CONTINUITY_PROOF_FILE="${GENERATED_DIR}/client_continuity_proof.bin"
+SERVER_CONTINUITY_PROOF_FILE="${GENERATED_DIR}/server_continuity_proof.bin"
+DEFAULT_CONTINUITY_EXPIRES_IN=300
 
-GEN_DEVICE_CERT="${GENERATED_DIR}/device_cert.pem"
-GEN_DEVICE_KEY="${GENERATED_DIR}/device_key.pem"
-
-SERVER_CSR="${GENERATED_DIR}/server.csr"
-DEVICE_CSR="${GENERATED_DIR}/device.csr"
-CA_SERIAL="${GENERATED_DIR}/ca_cert.srl"
-OPENSSL_EXT="${GENERATED_DIR}/openssl-ext.cnf"
+SERVER_LOG_FILE="${GENERATED_DIR}/server.log"
+SERVER_PID_FILE="${GENERATED_DIR}/server.pid"
 
 IDENT_HELPER_SRC="${GENERATED_DIR}/.zk_arche_ident_helper.c"
 IDENT_HELPER_BIN="${GENERATED_DIR}/.zk_arche_ident_helper"
@@ -96,13 +94,8 @@ ensure_state_dirs() {
   sudo chmod 700 "$BASE_STATE_DIR" "$SERVER_STATE_DIR" "$CLIENT_STATE_DIR" "$GENERATED_DIR"
 }
 
-ensure_client_state_dir() {
-  ensure_state_dirs
-}
-
-ensure_server_state_dir() {
-  ensure_state_dirs
-}
+ensure_client_state_dir() { ensure_state_dirs; }
+ensure_server_state_dir() { ensure_state_dirs; }
 
 ensure_client_root() {
   ensure_state_dirs
@@ -110,7 +103,11 @@ ensure_client_root() {
     log_step "Creating client device root at $CLIENT_DEVICE_ROOT"
     local tmp
     tmp="$(mktemp)"
-    openssl rand 32 > "$tmp"
+    if command -v openssl >/dev/null 2>&1; then
+      openssl rand 32 > "$tmp"
+    else
+      head -c 32 /dev/urandom > "$tmp"
+    fi
     sudo_write_file "$tmp" "$CLIENT_DEVICE_ROOT" 600
     secure_delete "$tmp"
     log_ok "Created client device root"
@@ -199,170 +196,14 @@ derive_server_pub_hex() {
   )
 }
 
-write_openssl_ext_file() {
-  local device_id="$1"
-  local device_pub="$2"
-  local server_pub="$3"
-
-  cat > "$OPENSSL_EXT" <<EOF
-[ ca_ext ]
-basicConstraints = critical, CA:true
-keyUsage = critical, keyCertSign, cRLSign
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always,issuer
-
-[ server_ext ]
-basicConstraints = critical, CA:false
-keyUsage = critical, digitalSignature
-extendedKeyUsage = serverAuth
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer
-1.3.6.1.4.1.55555.1.2 = ASN1:UTF8String:${server_pub}
-
-[ device_ext ]
-basicConstraints = critical, CA:false
-keyUsage = critical, digitalSignature
-extendedKeyUsage = clientAuth
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer
-1.3.6.1.4.1.55555.1.1 = ASN1:UTF8String:${device_id}
-1.3.6.1.4.1.55555.1.3 = ASN1:UTF8String:${device_pub}
-EOF
-}
-
-print_cert_summary() {
-  local cert="$1" label="$2"
-  if [[ -f "$cert" ]]; then
-    log_header "$label certificate summary"
-    openssl x509 -in "$cert" -noout -subject -issuer -dates
-    echo
-    openssl x509 -in "$cert" -noout -text | grep -A 3 "X509v3 Extended Key Usage" || true
-    openssl x509 -in "$cert" -noout -text | grep -A 8 "1.3.6.1.4.1.55555" || true
-  fi
-}
-
-generate_bound_certs() {
-  require_bin "$SERVER_BIN"
-  require_cmd openssl
-
-  ensure_state_dirs
-  ensure_client_root
-
-  local derived
-  derived="$(derive_client_identity_hex)"
-  local device_id device_pub server_pub
-  device_id="$(awk '{print $1}' <<<"$derived")"
-  device_pub="$(awk '{print $2}' <<<"$derived")"
-  server_pub="$(derive_server_pub_hex)"
-
-  validate_hex32 "$device_id" "device_id"
-  validate_hex32 "$device_pub" "device_pub"
-  validate_hex32 "$server_pub" "server_pub"
-
-  write_openssl_ext_file "$device_id" "$device_pub" "$server_pub"
-
-  log_header "Generating CA, server cert, and device cert"
-  log_val "device_id:" "$device_id"
-  log_val "device_pub:" "$device_pub"
-  log_val "server_pub:" "$server_pub"
-
-  rm -f "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY"
-  sudo rm -f "$SERVER_CA_KEY" "$SERVER_CA_CERT" "$SERVER_CERT" "$SERVER_CERT_KEY" \
-             "$SERVER_PUB_HEX_FILE" "${SERVER_STATE_DIR}/ca_cert.srl"
-
-  openssl genpkey -algorithm Ed25519 -out "$SERVER_CA_KEY.tmp" >/dev/null 2>&1
-
-  openssl req -x509 -new -key "$SERVER_CA_KEY.tmp" \
-    -out "$SERVER_CA_CERT.tmp" -days 365 \
-    -subj "/CN=ZK-ARCHE Demo CA" \
-    -extensions ca_ext -config "$OPENSSL_EXT" >/dev/null 2>&1
-
-  openssl genpkey -algorithm Ed25519 -out "$SERVER_CERT_KEY.tmp" >/dev/null 2>&1
-
-  openssl req -new -key "$SERVER_CERT_KEY.tmp" -out "$SERVER_CSR" \
-    -subj "/CN=zk-arche-server/OU=${server_pub}" >/dev/null 2>&1
-
-  openssl x509 -req -in "$SERVER_CSR" \
-    -CA "$SERVER_CA_CERT.tmp" -CAkey "$SERVER_CA_KEY.tmp" -CAcreateserial \
-    -out "$SERVER_CERT.tmp" -days 30 \
-    -extfile "$OPENSSL_EXT" -extensions server_ext >/dev/null 2>&1
-
-  if [[ -f "./ca_cert.srl" ]]; then
-    mv -f "./ca_cert.srl" "$CA_SERIAL"
-  fi
-
-  openssl genpkey -algorithm Ed25519 -out "$GEN_DEVICE_KEY" >/dev/null 2>&1
-
-  openssl req -new -key "$GEN_DEVICE_KEY" -out "$DEVICE_CSR" \
-    -subj "/CN=${device_id}/OU=${device_pub}" >/dev/null 2>&1
-
-  openssl x509 -req -in "$DEVICE_CSR" \
-    -CA "$SERVER_CA_CERT.tmp" -CAkey "$SERVER_CA_KEY.tmp" -CAcreateserial \
-    -out "$GEN_DEVICE_CERT" -days 30 \
-    -extfile "$OPENSSL_EXT" -extensions device_ext >/dev/null 2>&1
-
-  if [[ -f "./ca_cert.srl" ]]; then
-    mv -f "./ca_cert.srl" "$CA_SERIAL"
-  fi
-
-  printf '%s\n' "$server_pub" > "$SERVER_PUB_HEX_FILE.tmp"
-
-  sudo_write_file "$SERVER_CA_KEY.tmp" "$SERVER_CA_KEY" 600
-  sudo_write_file "$SERVER_CA_CERT.tmp" "$SERVER_CA_CERT" 644
-  sudo_write_file "$SERVER_CERT_KEY.tmp" "$SERVER_CERT_KEY" 600
-  sudo_write_file "$SERVER_CERT.tmp" "$SERVER_CERT" 644
-  sudo_write_file "$SERVER_PUB_HEX_FILE.tmp" "$SERVER_PUB_HEX_FILE" 644
-
-  secure_delete "$SERVER_CA_KEY.tmp"
-  rm -f "$SERVER_CA_CERT.tmp" "$SERVER_CERT_KEY.tmp" "$SERVER_CERT.tmp" "$SERVER_PUB_HEX_FILE.tmp"
-
-  chmod 600 "$GEN_DEVICE_KEY" 2>/dev/null || true
-  chmod 644 "$GEN_DEVICE_CERT" 2>/dev/null || true
-
-  print_cert_summary "$SERVER_CERT" "Server"
-  print_cert_summary "$GEN_DEVICE_CERT" "Device"
-
-  rm -f "$OPENSSL_EXT"
-
-  log_ok "Generated matching CA/server/device certs"
-  log_val "CA cert:" "$SERVER_CA_CERT"
-  log_val "Server cert:" "$SERVER_CERT"
-  log_val "Server key:" "$SERVER_CERT_KEY"
-  log_val "Device cert:" "$GEN_DEVICE_CERT"
-  log_val "Device key:" "$GEN_DEVICE_KEY"
-  log_warn "CA private key is on disk at: $SERVER_CA_KEY"
-  log_warn "For production use, run './zk-arche.sh export-ca-key' to move it offline."
-}
-
-install_client_certs_from_generated() {
-  require_file "$GEN_DEVICE_CERT"
-  require_file "$GEN_DEVICE_KEY"
-  require_file "$SERVER_CA_CERT"
-
-  ensure_client_state_dir
-  sudo install -m 644 "$GEN_DEVICE_CERT" "$CLIENT_DEVICE_CERT"
-  sudo install -m 600 "$GEN_DEVICE_KEY" "$CLIENT_DEVICE_KEY"
-  sudo install -m 644 "$SERVER_CA_CERT" "$CLIENT_CA_CERT"
-
-  log_step "Securely removing device private key from generated dir..."
-  secure_delete "$GEN_DEVICE_KEY"
-  log_ok "Client cert material installed in $CLIENT_STATE_DIR"
-  log_ok "Device private key removed from $GENERATED_DIR"
-}
-
 ensure_existing_server_material() {
   ensure_server_state_dir
-  require_file "$SERVER_CA_CERT"
-  require_file "$SERVER_CERT"
-  require_file "$SERVER_CERT_KEY"
+  require_file "$SERVER_SK_FILE"
 }
 
 ensure_existing_client_material() {
   ensure_client_state_dir
   require_file "$CLIENT_DEVICE_ROOT"
-  require_file "$CLIENT_DEVICE_CERT"
-  require_file "$CLIENT_DEVICE_KEY"
-  require_file "$CLIENT_CA_CERT"
 }
 
 ensure_existing_demo_material() {
@@ -372,23 +213,35 @@ ensure_existing_demo_material() {
   ensure_existing_client_material
 }
 
+_status_file() {
+  local path="$1" label="$2"
+  if sudo test -f "$path"; then
+    local size
+    size="$(sudo wc -c < "$path" | tr -d ' ')"
+    log_ok "$label: present (${size}B)"
+  else
+    log_warn "$label: absent"
+  fi
+}
+
 usage() {
   cat <<EOF2
 
-${_W}ZK-ARCHE automation script (C version, /var/lib/iot-auth layout)${_N}
+${_W}ZK-ARCHE automation script (C version, one-shot RPK + ZKP edition, /var/lib/iot-auth layout)${_N}
 
 ${_C}USAGE${_N}
   ./zk-arche.sh <command> [options]
 
-${_C}BUILD${_N}
+${_C}BUILD / BOOTSTRAP${_N}
   build
+  init-rpk
+  pin-server <server_pub_hex>
+  show-pinned-key
 
-${_C}CERTIFICATE COMMANDS${_N}
-  make-certs
-  install-client-certs
-  check-server-certs
-  check-client-certs
-  export-ca-key
+${_C}STATE INSPECTION${_N}
+  check-server-state
+  check-client-state
+  status
 
 ${_C}SERVER COMMANDS${_N}
   start-server <bind_addr> [opts]
@@ -398,10 +251,17 @@ ${_C}SERVER COMMANDS${_N}
 ${_C}CLIENT COMMANDS${_N}
   setup-device <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
   auth-device <server_ip:port>
-  show-pinned-key
-  pin-server <server_pub_hex>
+  make-offline-proof [--output <file>] [--audience <name>] [--scope <scope>] [--expires-in <1..300>] [--request-file <path>|--request-text <text>|--request-hash <hex>]
+  make-client-continuity-proof [--output <file>] [--expires-in <1..300>]
+  verify-server-continuity-proof [--proof <file>]
   reset-client
-  status
+
+${_C}OFFLINE TEST COMMANDS${_N}
+  verify-offline-proof [--proof <file>] [--audience <name>] [--allow-scope <scope>]...
+  offline-local [--audience <name>] [--scope <scope>] [--expires-in <1..300>] [--request-file <path>|--request-text <text>|--request-hash <hex>]
+  make-server-continuity-proof --peer-id <client_device_id_hex> [--output <file>] [--expires-in <1..300>]
+  verify-client-continuity-proof [--proof <file>]
+  continuity-local [--expires-in <1..300>]
 
 ${_C}COMBINED FLOWS${_N}
   client-local <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
@@ -411,64 +271,79 @@ ${_C}COMBINED FLOWS${_N}
 ${_C}RECOMMENDED LOCAL TEST FLOW${_N}
   ./zk-arche.sh build
   sudo ./zk-arche.sh reset-all
-  ./zk-arche.sh make-certs
+  sudo ./zk-arche.sh init-rpk
   sudo ./zk-arche.sh server-local 127.0.0.1:4000
-  sudo ./zk-arche.sh client-local 127.0.0.1:4000
+  sudo ./zk-arche.sh client-local 127.0.0.1:4000 --allow-tofu-setup
+  sudo ./zk-arche.sh auth-device 127.0.0.1:4000
+  ./zk-arche.sh offline-local --request-text "cached telemetry payload"
+  ./zk-arche.sh continuity-local
 
 EOF2
 }
 
 cmd_build() {
   require_cmd gcc
+  local sodium_cflags sodium_libs openssl_libs pthread_libs
+  sodium_cflags="$(pkg-config --cflags libsodium 2>/dev/null || true)"
+  sodium_libs="$(pkg-config --libs libsodium 2>/dev/null || echo '-lsodium')"
+  openssl_libs="$(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+  pthread_libs="-lpthread"
+
   log_header "Building C binaries"
 
-  gcc -O2 -std=c11 -Wall -Wextra "${PROJECT_ROOT}/server.c" -o "$SERVER_BIN" -lsodium -lssl -lcrypto -lpthread
-  gcc -O2 -std=c11 -Wall -Wextra "${PROJECT_ROOT}/client.c" -o "$CLIENT_BIN" -lsodium -lssl -lcrypto
+  gcc -O2 -std=c11 -Wall -Wextra -pedantic \
+    ${sodium_cflags} \
+    "$PROJECT_ROOT/server.c" \
+    -o "$SERVER_BIN" \
+    ${sodium_libs} ${openssl_libs} ${pthread_libs}
+
+  gcc -O2 -std=c11 -Wall -Wextra -pedantic \
+    ${sodium_cflags} \
+    "$PROJECT_ROOT/client.c" \
+    -o "$CLIENT_BIN" \
+    ${sodium_libs} ${openssl_libs}
 
   log_ok "Server: $SERVER_BIN"
   log_ok "Client: $CLIENT_BIN"
 }
 
-cmd_make_certs() {
+cmd_init_rpk() {
   require_bin "$SERVER_BIN"
   require_bin "$CLIENT_BIN"
-  generate_bound_certs
-  install_client_certs_from_generated
+  log_header "Initializing raw-public-key state"
+  ensure_state_dirs
+  ensure_client_root
 
   local server_pub
   server_pub="$(derive_server_pub_hex)"
   validate_hex32 "$server_pub" "server_pub"
-  log_step "Pinning generated local server public key on the client..."
-  sudo "$CLIENT_BIN" --pin-server-pub "$server_pub"
-  log_ok "Pinned local server public key for hardened setup flow"
+  cmd_pin_server "$server_pub"
+
+  local derived did dpub
+  derived="$(derive_client_identity_hex)"
+  did="$(awk '{print $1}' <<<"$derived")"
+  dpub="$(awk '{print $2}' <<<"$derived")"
+  [[ -n "$did" ]] && log_val "device_id:" "$did"
+  [[ -n "$dpub" ]] && log_val "device_pub:" "$dpub"
+  log_val "server_pub:" "$server_pub"
+  log_ok "RPK bootstrap material initialized"
 }
 
-cmd_install_client_certs() {
-  log_header "Installing client cert material from existing generated files"
-  require_bin "$CLIENT_BIN"
-  install_client_certs_from_generated
-}
-
-cmd_check_server_certs() {
-  log_header "Server certificate files"
-  _status_file "$SERVER_CA_CERT" "ca cert"
-  _status_file "$SERVER_CA_KEY" "ca key"
-  _status_file "$SERVER_CERT" "server cert"
-  _status_file "$SERVER_CERT_KEY" "server cert key"
+cmd_check_server_state() {
+  log_header "Server state files"
   _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_REGISTRY" "device registry"
   _status_file "$SERVER_REGISTRY_BAK" "device registry backup"
   _status_file "$SERVER_REPLAY_CACHE" "replay cache"
+  _status_file "$SERVER_OFFLINE_COUNTERS" "offline counter store"
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 }
 
-cmd_check_client_certs() {
-  log_header "Client certificate files"
+cmd_check_client_state() {
+  log_header "Client state files"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
-  _status_file "$CLIENT_DEVICE_CERT" "device cert"
-  _status_file "$CLIENT_DEVICE_KEY" "device key"
-  _status_file "$CLIENT_CA_CERT" "ca cert"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
+  _status_file "$CLIENT_ROLE_CRED" "role credential"
 }
 
 cmd_start_server() {
@@ -512,7 +387,8 @@ cmd_server_local() {
   [[ ${#extra_flags[@]} -gt 0 ]] && log_info "Extra flags: ${extra_flags[*]}"
   echo
   log_info "In a second terminal run:"
-  echo -e "    ${_Y}sudo ./zk-arche.sh client-local $bind_addr${_N}"
+  echo -e "    ${_Y}sudo ./zk-arche.sh client-local $bind_addr --allow-tofu-setup${_N}"
+  echo -e "    ${_Y}sudo ./zk-arche.sh auth-device $bind_addr${_N}"
   echo
 
   cd "$SERVER_STATE_DIR"
@@ -537,22 +413,6 @@ cmd_pin_server() {
   log_ok "Server public key pinned"
 }
 
-cmd_export_ca_key() {
-  if ! sudo test -f "$SERVER_CA_KEY"; then
-    log_warn "CA key not found at: $SERVER_CA_KEY"
-    return
-  fi
-  log_header "CA private key export (production hardening)"
-  log_warn "Copy the key below to secure offline storage, then it will be removed from this machine."
-  echo
-  sudo cat "$SERVER_CA_KEY"
-  echo
-  log_step "Removing CA private key from server..."
-  sudo shred -u "$SERVER_CA_KEY" 2>/dev/null || sudo rm -f "$SERVER_CA_KEY"
-  log_ok "CA private key removed from $SERVER_STATE_DIR"
-  log_warn "Store the printed key securely offline. Without it you cannot issue new device certificates."
-}
-
 cmd_setup_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -ge 1 ]] || die "setup-device requires <server_ip:port>"
@@ -572,10 +432,15 @@ cmd_setup_device() {
 
   ensure_existing_client_material
 
-  log_header "Device setup (mutual certificate onboarding)"
+  log_header "Device setup (raw-public-key onboarding)"
   log_info "Server: $server_addr"
   [[ ${#extra_flags[@]} -gt 0 ]] && log_info "Extra flags: ${extra_flags[*]}"
   sudo "$CLIENT_BIN" --server "$server_addr" --setup "${extra_flags[@]}"
+
+  if sudo test -f "$CLIENT_ROLE_CRED"; then
+    log_ok "Role credential present: $CLIENT_ROLE_CRED"
+    log_val "role credential:" "$CLIENT_ROLE_CRED"
+  fi
 
   if sudo test -f "$CLIENT_SERVER_PUB"; then
     local pinned_hex
@@ -591,7 +456,7 @@ cmd_auth_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -eq 1 ]] || die "auth-device requires <server_ip:port>"
   ensure_existing_client_material
-  log_header "Device authentication"
+  log_header "Device authentication (one-shot)"
   log_info "Server: $1"
   sudo "$CLIENT_BIN" --server "$1"
   log_ok "Authentication complete"
@@ -609,22 +474,11 @@ cmd_show_pinned_key() {
   log_val "Fingerprint:" "$hex"
 }
 
-_status_file() {
-  local path="$1" label="$2"
-  if sudo test -f "$path"; then
-    local size
-    size="$(sudo wc -c < "$path" | tr -d ' ')"
-    log_ok "$label: present (${size}B)"
-  else
-    log_warn "$label: absent"
-  fi
-}
-
 cmd_status() {
-  log_header "ZK-ARCHE status (C version)"
+  log_header "ZK-ARCHE status (C RPK + ZKP edition)"
   echo -e "\n${_W}Binaries${_N}"
-  [[ -x "$SERVER_BIN" ]] && log_ok "c_server binary: $SERVER_BIN" || log_warn "c_server binary: not built ($SERVER_BIN)"
-  [[ -x "$CLIENT_BIN" ]] && log_ok "c_client binary: $CLIENT_BIN" || log_warn "c_client binary: not built ($CLIENT_BIN)"
+  [[ -x "$SERVER_BIN" ]] && log_ok "server binary: $SERVER_BIN" || log_warn "server binary: not built ($SERVER_BIN)"
+  [[ -x "$CLIENT_BIN" ]] && log_ok "client binary: $CLIENT_BIN" || log_warn "client binary: not built ($CLIENT_BIN)"
 
   echo -e "\n${_W}State root${_N}"
   log_val "path:" "$BASE_STATE_DIR"
@@ -632,16 +486,9 @@ cmd_status() {
   echo -e "\n${_W}Server state${_N}  ($SERVER_STATE_DIR)"
   _status_file "$SERVER_REGISTRY" "device registry"
   _status_file "$SERVER_REGISTRY_BAK" "device registry backup"
-  _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_REPLAY_CACHE" "replay cache"
-  _status_file "$SERVER_CA_CERT" "ca cert"
-  if sudo test -f "$SERVER_CA_KEY"; then
-    log_warn "ca key: present on server (consider running 'export-ca-key' for production)"
-  else
-    log_ok "ca key: absent (offline — good)"
-  fi
-  _status_file "$SERVER_CERT" "server cert"
-  _status_file "$SERVER_CERT_KEY" "server cert key"
+  _status_file "$SERVER_OFFLINE_COUNTERS" "offline counter store"
+  _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 
   if [[ -x "$SERVER_BIN" ]]; then
@@ -652,10 +499,8 @@ cmd_status() {
 
   echo -e "\n${_W}Client state${_N}  ($CLIENT_STATE_DIR)"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
-  _status_file "$CLIENT_DEVICE_CERT" "device cert"
-  _status_file "$CLIENT_DEVICE_KEY" "device key"
-  _status_file "$CLIENT_CA_CERT" "ca cert"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
+  _status_file "$CLIENT_ROLE_CRED" "role credential"
 
   if sudo test -f "$CLIENT_DEVICE_ROOT"; then
     local derived did dpub
@@ -666,6 +511,10 @@ cmd_status() {
     [[ -n "$dpub" ]] && log_val "device_pub:" "$dpub"
   fi
 
+  if sudo test -f "$CLIENT_ROLE_CRED"; then
+    log_ok "Role credential present: $CLIENT_ROLE_CRED"
+  fi
+
   if sudo test -f "$CLIENT_SERVER_PUB"; then
     local hex
     hex="$(sudo xxd -p -c 32 "$CLIENT_SERVER_PUB" 2>/dev/null || true)"
@@ -673,16 +522,11 @@ cmd_status() {
   fi
 
   echo -e "\n${_W}Generated files${_N}  ($GENERATED_DIR)"
-  if [[ -f "$GEN_DEVICE_CERT" ]]; then _status_file "$GEN_DEVICE_CERT" "generated device cert"; else log_ok "generated device cert: absent (cleaned up — good)"; fi
-  if [[ -f "$GEN_DEVICE_KEY" ]]; then
-    log_warn "generated device key: present (run install-client-certs to install and remove)"
-  else
-    log_ok "generated device key: absent (cleaned up — good)"
-  fi
-  if [[ -f "$SERVER_CSR" ]]; then _status_file "$SERVER_CSR" "server csr"; else log_warn "server csr: absent"; fi
-  if [[ -f "$DEVICE_CSR" ]]; then _status_file "$DEVICE_CSR" "device csr"; else log_warn "device csr: absent"; fi
-  if [[ -f "$CA_SERIAL" ]]; then _status_file "$CA_SERIAL" "ca serial"; else log_warn "ca serial: absent"; fi
-  if [[ -f "$OPENSSL_EXT" ]]; then _status_file "$OPENSSL_EXT" "openssl ext config"; else log_ok "openssl ext config: absent (cleaned up — good)"; fi
+  if [[ -f "$OFFLINE_PROOF_FILE" ]]; then _status_file "$OFFLINE_PROOF_FILE" "offline proof artifact"; else log_warn "offline proof artifact: absent"; fi
+  if [[ -f "$OFFLINE_REQUEST_FILE" ]]; then _status_file "$OFFLINE_REQUEST_FILE" "offline request sample"; else log_warn "offline request sample: absent"; fi
+  if [[ -f "$CLIENT_CONTINUITY_PROOF_FILE" ]]; then _status_file "$CLIENT_CONTINUITY_PROOF_FILE" "client continuity proof"; else log_warn "client continuity proof: absent"; fi
+  if [[ -f "$SERVER_CONTINUITY_PROOF_FILE" ]]; then _status_file "$SERVER_CONTINUITY_PROOF_FILE" "server continuity proof"; else log_warn "server continuity proof: absent"; fi
+  if [[ -f "$SERVER_LOG_FILE" ]]; then _status_file "$SERVER_LOG_FILE" "server log"; else log_warn "server log: absent"; fi
 }
 
 cmd_client_local() {
@@ -708,6 +552,10 @@ cmd_client_local() {
   log_step "Running device setup..."
   sudo "$CLIENT_BIN" --server "$server_addr" --setup "${pairing_token_flags[@]}"
   log_ok "Setup complete"
+
+  log_step "Running one-shot authentication..."
+  sudo "$CLIENT_BIN" --server "$server_addr"
+  log_ok "Authentication complete"
 }
 
 cmd_full_device_onboard() {
@@ -730,9 +578,239 @@ cmd_full_device_onboard() {
   cmd_setup_device "${setup_args[@]}"
 }
 
+cmd_make_offline_proof() {
+  require_bin "$CLIENT_BIN"
+  ensure_existing_client_material
+
+  local output="$OFFLINE_PROOF_FILE"
+  local audience="$DEFAULT_OFFLINE_AUDIENCE"
+  local scope="$DEFAULT_OFFLINE_SCOPE"
+  local expires_in="$DEFAULT_OFFLINE_EXPIRES_IN"
+  local request_file=""
+  local request_text=""
+  local request_hash=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
+      --audience) [[ $# -ge 2 ]] || die "--audience requires a value"; audience="$2"; shift 2 ;;
+      --scope) [[ $# -ge 2 ]] || die "--scope requires a value"; scope="$2"; shift 2 ;;
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      --request-file) [[ $# -ge 2 ]] || die "--request-file requires a value"; request_file="$2"; shift 2 ;;
+      --request-text) [[ $# -ge 2 ]] || die "--request-text requires a value"; request_text="$2"; shift 2 ;;
+      --request-hash) [[ $# -ge 2 ]] || die "--request-hash requires a value"; request_hash="$2"; shift 2 ;;
+      *) die "make-offline-proof: unknown option: $1" ;;
+    esac
+  done
+
+  local req_args=()
+  if [[ -n "$request_file" ]]; then
+    [[ -f "$request_file" ]] || die "Request file not found: $request_file"
+    req_args=(--request-file "$request_file")
+  elif [[ -n "$request_text" ]]; then
+    ensure_state_dirs
+    printf '%s' "$request_text" > "$OFFLINE_REQUEST_FILE"
+    chmod 600 "$OFFLINE_REQUEST_FILE" 2>/dev/null || true
+    req_args=(--request-file "$OFFLINE_REQUEST_FILE")
+  elif [[ -n "$request_hash" ]]; then
+    validate_hex32 "$request_hash" "request_hash"
+    req_args=(--request-hash "$request_hash")
+  else
+    ensure_state_dirs
+    printf '%s' 'offline fallback request' > "$OFFLINE_REQUEST_FILE"
+    chmod 600 "$OFFLINE_REQUEST_FILE" 2>/dev/null || true
+    req_args=(--request-file "$OFFLINE_REQUEST_FILE")
+  fi
+
+  mkdir -p "$(dirname "$output")"
+
+  log_header "Build offline proof artifact"
+  log_info "Output: $output"
+  log_info "Audience: $audience"
+  log_info "Scope: $scope"
+  log_info "Expires in: ${expires_in}s"
+
+  sudo "$CLIENT_BIN" \
+    --make-offline-proof "$output" \
+    --audience "$audience" \
+    --scope "$scope" \
+    --offline-expires-in "$expires_in" \
+    "${req_args[@]}"
+
+  log_ok "Offline proof written: $output"
+}
+
+cmd_verify_offline_proof() {
+  require_bin "$SERVER_BIN"
+  ensure_existing_server_material
+
+  local proof="$OFFLINE_PROOF_FILE"
+  local audience="$DEFAULT_OFFLINE_AUDIENCE"
+  local scopes=("$DEFAULT_OFFLINE_SCOPE")
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proof) [[ $# -ge 2 ]] || die "--proof requires a value"; proof="$2"; shift 2 ;;
+      --audience) [[ $# -ge 2 ]] || die "--audience requires a value"; audience="$2"; shift 2 ;;
+      --allow-scope|--allow-offline-scope) [[ $# -ge 2 ]] || die "$1 requires a value"; scopes+=("$2"); shift 2 ;;
+      *) die "verify-offline-proof: unknown option: $1" ;;
+    esac
+  done
+
+  [[ -f "$proof" ]] || die "Offline proof file not found: $proof"
+
+  local allow_args=()
+  local uniq_scopes
+  mapfile -t uniq_scopes < <(printf '%s\n' "${scopes[@]}" | awk 'NF && !seen[$0]++')
+  for s in "${uniq_scopes[@]}"; do
+    allow_args+=(--allow-offline-scope "$s")
+  done
+
+  log_header "Verify offline proof artifact"
+  log_info "Proof: $proof"
+  log_info "Audience: $audience"
+  log_info "Allowed scopes: ${uniq_scopes[*]}"
+
+  (cd "$SERVER_STATE_DIR" && sudo "$SERVER_BIN" --verify-offline-proof "$proof" --audience "$audience" "${allow_args[@]}")
+
+  log_ok "Offline proof verification succeeded"
+}
+
+cmd_offline_local() {
+  local mk_args=()
+  local verify_args=()
+  local output="$OFFLINE_PROOF_FILE"
+  local audience="$DEFAULT_OFFLINE_AUDIENCE"
+  local scope="$DEFAULT_OFFLINE_SCOPE"
+  local expires_in="$DEFAULT_OFFLINE_EXPIRES_IN"
+  local request_mode=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
+      --audience) [[ $# -ge 2 ]] || die "--audience requires a value"; audience="$2"; shift 2 ;;
+      --scope) [[ $# -ge 2 ]] || die "--scope requires a value"; scope="$2"; shift 2 ;;
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      --request-file|--request-text|--request-hash) [[ $# -ge 2 ]] || die "$1 requires a value"; request_mode=("$1" "$2"); shift 2 ;;
+      *) die "offline-local: unknown option: $1" ;;
+    esac
+  done
+
+  mk_args=(--output "$output" --audience "$audience" --scope "$scope" --expires-in "$expires_in")
+  if [[ ${#request_mode[@]} -gt 0 ]]; then
+    mk_args+=("${request_mode[@]}")
+  fi
+  verify_args=(--proof "$output" --audience "$audience" --allow-scope "$scope")
+
+  log_header "Offline fallback local test"
+  cmd_make_offline_proof "${mk_args[@]}"
+  cmd_verify_offline_proof "${verify_args[@]}"
+}
+
+cmd_make_client_continuity_proof() {
+  require_bin "$CLIENT_BIN"
+  ensure_existing_client_material
+  local output="$CLIENT_CONTINUITY_PROOF_FILE"
+  local expires_in="$DEFAULT_CONTINUITY_EXPIRES_IN"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      *) die "make-client-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  mkdir -p "$(dirname "$output")"
+  log_header "Build client continuity proof"
+  log_info "Output: $output"
+  log_info "Expires in: ${expires_in}s"
+  sudo "$CLIENT_BIN" --make-client-continuity-proof "$output" --continuity-expires-in "$expires_in"
+  log_ok "Client continuity proof written: $output"
+}
+
+cmd_verify_server_continuity_proof() {
+  require_bin "$CLIENT_BIN"
+  ensure_existing_client_material
+  local proof="$SERVER_CONTINUITY_PROOF_FILE"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proof) [[ $# -ge 2 ]] || die "--proof requires a value"; proof="$2"; shift 2 ;;
+      *) die "verify-server-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  [[ -f "$proof" ]] || die "Server continuity proof file not found: $proof"
+  log_header "Verify server continuity proof"
+  log_info "Proof: $proof"
+  sudo "$CLIENT_BIN" --verify-server-continuity-proof "$proof"
+  log_ok "Server continuity proof verification succeeded"
+}
+
+cmd_make_server_continuity_proof() {
+  require_bin "$SERVER_BIN"
+  ensure_existing_server_material
+  local output="$SERVER_CONTINUITY_PROOF_FILE"
+  local expires_in="$DEFAULT_CONTINUITY_EXPIRES_IN"
+  local peer_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      --peer-id) [[ $# -ge 2 ]] || die "--peer-id requires a value"; peer_id="$2"; shift 2 ;;
+      *) die "make-server-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$peer_id" ]] || die "make-server-continuity-proof requires --peer-id <client_device_id_hex>"
+  validate_hex32 "$peer_id" "peer-id"
+  mkdir -p "$(dirname "$output")"
+  log_header "Build server continuity proof"
+  log_info "Output: $output"
+  log_info "Peer id: $peer_id"
+  log_info "Expires in: ${expires_in}s"
+  (cd "$SERVER_STATE_DIR" && sudo "$SERVER_BIN" --make-server-continuity-proof "$output" --peer-id "$peer_id" --continuity-expires-in "$expires_in")
+  log_ok "Server continuity proof written: $output"
+}
+
+cmd_verify_client_continuity_proof() {
+  require_bin "$SERVER_BIN"
+  ensure_existing_server_material
+  local proof="$CLIENT_CONTINUITY_PROOF_FILE"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proof) [[ $# -ge 2 ]] || die "--proof requires a value"; proof="$2"; shift 2 ;;
+      *) die "verify-client-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  [[ -f "$proof" ]] || die "Client continuity proof file not found: $proof"
+  log_header "Verify client continuity proof"
+  log_info "Proof: $proof"
+  (cd "$SERVER_STATE_DIR" && sudo "$SERVER_BIN" --verify-client-continuity-proof "$proof")
+  log_ok "Client continuity proof verification succeeded"
+}
+
+cmd_continuity_local() {
+  local expires_in="$DEFAULT_CONTINUITY_EXPIRES_IN"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      *) die "continuity-local: unknown option: $1" ;;
+    esac
+  done
+  ensure_existing_demo_material
+  local derived did
+  derived="$(derive_client_identity_hex 2>/dev/null || true)"
+  did="$(awk '{print $1}' <<<"$derived")"
+  [[ -n "$did" ]] || die "Could not derive client device_id; make sure client state exists"
+
+  log_header "Continuity local test"
+  cmd_make_client_continuity_proof --output "$CLIENT_CONTINUITY_PROOF_FILE" --expires-in "$expires_in"
+  cmd_verify_client_continuity_proof --proof "$CLIENT_CONTINUITY_PROOF_FILE"
+  cmd_make_server_continuity_proof --output "$SERVER_CONTINUITY_PROOF_FILE" --peer-id "$did" --expires-in "$expires_in"
+  cmd_verify_server_continuity_proof --proof "$SERVER_CONTINUITY_PROOF_FILE"
+}
+
 cmd_reset_client() {
   log_warn "Resetting client state: $CLIENT_STATE_DIR"
   sudo rm -rf "$CLIENT_STATE_DIR"
+  rm -f "$OFFLINE_PROOF_FILE" "$OFFLINE_REQUEST_FILE" "$CLIENT_CONTINUITY_PROOF_FILE" "$SERVER_CONTINUITY_PROOF_FILE"
   sudo mkdir -p "$CLIENT_STATE_DIR"
   sudo chmod 700 "$CLIENT_STATE_DIR"
   log_ok "Client state removed"
@@ -740,18 +818,17 @@ cmd_reset_client() {
 
 cmd_reset_server() {
   log_warn "Resetting server state in: $SERVER_STATE_DIR"
-  sudo rm -f "$SERVER_REGISTRY" \
-             "$SERVER_REGISTRY_BAK" \
-             "$SERVER_REPLAY_CACHE" \
-             "$SERVER_SK_FILE" \
-             "${SERVER_STATE_DIR}/server_pub.bin" \
-             "$SERVER_PUB_HEX_FILE" \
-             "$SERVER_CERT" "$SERVER_CERT_KEY" \
-             "$SERVER_CA_CERT" "$SERVER_CA_KEY" \
-             "${SERVER_STATE_DIR}/ca_cert.srl"
-  rm -f "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY" \
-        "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" "$OPENSSL_EXT" \
-        "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN"
+  sudo rm -f \
+    "$SERVER_REGISTRY" \
+    "$SERVER_REGISTRY_BAK" \
+    "$SERVER_REPLAY_CACHE" \
+    "$SERVER_SK_FILE" \
+    "${SERVER_STATE_DIR}/server_pub.bin" \
+    "$SERVER_PUB_HEX_FILE" \
+    "$SERVER_OFFLINE_COUNTERS"
+  rm -f "$OFFLINE_PROOF_FILE" "$OFFLINE_REQUEST_FILE" "$CLIENT_CONTINUITY_PROOF_FILE" \
+        "$SERVER_CONTINUITY_PROOF_FILE" "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN" \
+        "$SERVER_LOG_FILE" "$SERVER_PID_FILE"
   log_ok "Server state removed"
 }
 
@@ -770,16 +847,22 @@ main() {
   local cmd="$1"; shift
   case "$cmd" in
     build) cmd_build "$@" ;;
-    make-certs) cmd_make_certs "$@" ;;
-    install-client-certs) cmd_install_client_certs "$@" ;;
-    check-server-certs) cmd_check_server_certs "$@" ;;
-    check-client-certs) cmd_check_client_certs "$@" ;;
-    export-ca-key) cmd_export_ca_key "$@" ;;
+    init-rpk) cmd_init_rpk "$@" ;;
+    check-server-state) cmd_check_server_state "$@" ;;
+    check-client-state) cmd_check_client_state "$@" ;;
     start-server) cmd_start_server "$@" ;;
     server-local) cmd_server_local "$@" ;;
     pin-server) cmd_pin_server "$@" ;;
     setup-device) cmd_setup_device "$@" ;;
     auth-device) cmd_auth_device "$@" ;;
+    make-offline-proof) cmd_make_offline_proof "$@" ;;
+    verify-offline-proof) cmd_verify_offline_proof "$@" ;;
+    offline-local) cmd_offline_local "$@" ;;
+    make-client-continuity-proof) cmd_make_client_continuity_proof "$@" ;;
+    verify-server-continuity-proof) cmd_verify_server_continuity_proof "$@" ;;
+    make-server-continuity-proof) cmd_make_server_continuity_proof "$@" ;;
+    verify-client-continuity-proof) cmd_verify_client_continuity_proof "$@" ;;
+    continuity-local) cmd_continuity_local "$@" ;;
     show-pinned-key) cmd_show_pinned_key "$@" ;;
     status) cmd_status "$@" ;;
     client-local) cmd_client_local "$@" ;;
@@ -788,7 +871,11 @@ main() {
     reset-server) cmd_reset_server "$@" ;;
     reset-all) cmd_reset_all "$@" ;;
     -h|--help|help) usage ;;
-    *) log_error "Unknown command: $cmd"; usage; exit 1 ;;
+    *)
+      log_error "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
   esac
 }
 
