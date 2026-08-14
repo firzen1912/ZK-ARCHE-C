@@ -1,333 +1,180 @@
-# ZK-ARCHE (C Implementation)
+# ZK-ARCHE — C Implementation
 
-ZK-ARCHE is a C implementation of lightweight **zero-knowledge mutual authentication** for constrained and IoT-style environments. It uses **Schnorr proofs over Ristretto255** for device authentication, hides the device identity during the operational authentication flow, and supports **mutual-certificate onboarding** aligned with the Rust implementation.
+ZK-ARCHE is a C/libsodium implementation of lightweight, privacy-oriented mutual authentication for constrained and IoT-style systems. The current `main` branch implements the **ZK-ARCHE v2 online-authentication design** using Ristretto255, Schnorr proofs, per-session pseudonyms, re-randomized role commitments, anonymous role-set membership proofs, ephemeral Ristretto Diffie-Hellman key agreement, and HMAC-based key confirmation.
 
-## What this implementation provides
+> **Current implementation note:** the active protocol no longer uses certificate-based onboarding, X25519, or a ChaCha20-Poly1305 outer tunnel. Setup is raw-public-key (RPK) based, and v2 authentication payloads are sent directly over TCP. The session key is derived from the Ristretto ephemeral DH secret and confirmed with HMAC, but the current handshake payloads are not protected by an application-layer AEAD.
 
-- **Mutual-certificate onboarding (SETUP)** using client and server certificates plus transcript signatures.
-- **Pinned server key enforcement** during both setup and authentication to resist MITM substitution.
-- **Hidden device identity during AUTH** using an X25519 ECDHE tunnel with ChaCha20-Poly1305 protected payloads.
-- **Mutual authentication with key confirmation** using `server finished` and `client finished` style HMAC tags over the session transcript.
-- **Replay protection** on the server with persistent nonce tracking.
-- **A helper automation script** for building, certificate generation, local testing, setup, authentication, status checks, and state reset.
+## Current protocol status
 
----
-
-## Architecture
-
-| Component | Role |
+| Area | Current `main` behavior |
 | --- | --- |
-| Raspberry Pi / IoT device | Prover / client |
-| Ubuntu / Linux server | Verifier / server |
-| Device root secret | Stable per-device operational identity seed |
-| Device certificate | Client onboarding credential |
-| Server certificate | Server onboarding credential |
-| CA certificate | Trust anchor for onboarding |
-| Registry | Stores enrolled device identities |
-
----
-
-## Cryptographic design
-
-| Primitive | Algorithm |
-| --- | --- |
-| Group | Ristretto255 |
-| Proof system | Schnorr ZKP |
-| Fiat-Shamir hash | SHA-512 |
+| Enrollment | Raw-public-key setup with mutual Schnorr proofs |
+| Server trust | Pinned Ristretto server public key; explicit TOFU setup option for bootstrap/debug use |
+| Device identity | Stable identity at enrollment; per-session `pid` during online AUTH |
+| Client authentication | Schnorr proof over Ristretto255 |
+| Server authentication | Schnorr proof of the pinned server static secret |
+| Role authorization | Re-randomized role commitment plus CDS/OR-style set-membership proof |
+| Allowed role set | `1` and `2` |
+| Key agreement | Ephemeral Ristretto Diffie-Hellman |
 | KDF | HKDF-SHA256 |
-| AEAD | ChaCha20-Poly1305 |
-| Anonymous tunnel | X25519 ECDHE |
-| Transcript hash / device ID derivation support | Blake2b |
+| Key confirmation | HMAC-SHA256 |
+| Replay protection | Persistent server replay cache |
+| Transport | TCP with 5-second I/O timeout |
+
+## ZK-ARCHE v2 model
+
+### Persistent device identity
+
+The client stores a 32-byte root secret at:
+
+```text
+/var/lib/iot-auth/client/device_root.bin
+```
+
+The implementation deterministically derives a stable device identifier and Ristretto authentication key pair from that root. The stable device identifier is used during setup but is not the online AUTH identifier.
+
+### Raw-public-key setup
+
+Setup uses `MSG_SETUP = 0x01`. The device and server exchange static Ristretto public keys and prove possession of their corresponding secrets with transcript-bound Schnorr proofs. Enrollment is gated by the server pairing policy; an optional pairing token and expiration window can be configured.
+
+The server key should normally be pinned before enrollment. `--allow-tofu-setup` permits trust-on-first-use for bootstrap/debug flows.
+
+### Per-session pseudonym
+
+Online authentication uses `MSG_AUTH_V2 = 0x03`. The client computes a fresh pseudonym from the enrolled device public key, client nonce, client ephemeral Ristretto public key, and server static public key:
+
+```text
+pid = SHA-256(domain || device_pub || nonce_c || eph_c || server_pub)
+```
+
+The server recomputes candidate PIDs from enrolled records to find the matching device without requiring the stable device ID on the wire.
+
+### Anonymous role authorization
+
+The server registry stores a role commitment for each enrolled device. During authentication, the client:
+
+1. re-randomizes its enrolled commitment;
+2. proves the fresh commitment is a valid re-randomization of the stored one; and
+3. gives a CDS/OR-style zero-knowledge proof that the committed role belongs to the compiled allowed set.
+
+The current allowed set is:
+
+```text
+[1, 2]
+```
+
+This proves membership in the authorized role class without revealing which allowed role is held.
+
+### Mutual authentication and session key
+
+The client authenticates with a Schnorr proof tied to the per-session PID. The server authenticates with a Schnorr proof of its pinned static key. Both sides derive a session key from ephemeral Ristretto Diffie-Hellman plus nonces and the PID using HKDF-SHA256, then exchange HMAC-SHA256 key-confirmation tags.
+
+## Cryptographic building blocks
+
+| Function | Primitive |
+| --- | --- |
+| Group | Ristretto255 via libsodium |
+| Client/server knowledge proofs | Schnorr |
+| Fiat-Shamir challenge hash | SHA-512 |
+| Per-session pseudonym | SHA-256 |
+| Device-root derivation | libsodium generic hash / BLAKE2b |
+| Role commitment | Ristretto commitment with domain-derived attribute generator |
+| Role privacy | Commitment re-randomization + CDS/OR set-membership proof |
+| Ephemeral key agreement | Ristretto Diffie-Hellman |
+| Session KDF | HKDF-SHA256 |
 | Key confirmation | HMAC-SHA256 |
 | Constant-time comparison | `sodium_memcmp` |
 | Secret cleanup | `sodium_memzero` |
-| Certificate handling | OpenSSL |
-| Transport | TCP |
-
-Primary C libraries used in the code include **libsodium** for Ristretto255, X25519, hashing, AEAD, and secure memory handling, plus **OpenSSL** for certificate parsing, signature verification, and certificate-chain validation.
-
----
-
-## Protocol model
-
-### 1. Operational device identity
-
-The client stores a persistent `device_root.bin`. From that root secret, the implementation deterministically derives:
-
-- `device_id`
-- the device private scalar `x`
-- the corresponding device public key `G * x`
-
-This operational identity is what the Schnorr authentication flow proves knowledge of during AUTH.
-
-### 2. Setup / onboarding
-
-The current C implementation no longer uses the older bootstrap-secret onboarding flow. The setup path now follows a **certificate-based mutual onboarding handshake** aligned with the Rust version. The server loads its certificate, certificate private key, CA certificate, and static server secret; the client uses its device certificate, device private key, CA certificate, and pinned server public key state.
-
-### 3. Authentication
-
-During AUTH, the client proves possession of its operational secret with a Schnorr proof. The device identity is protected inside an X25519-based encrypted tunnel, and the server proves possession of its own static secret. Both sides then verify key-confirmation tags derived from the shared session context.
-
-### 4. Server key pinning
-
-The client stores the server’s pinned public key in:
-
-```text
-/var/lib/iot-auth/client/server_pub.bin
-```
-
-The helper script can show or set this value with `show-pinned-key` and `pin-server`. The C client also supports raw `--pin-server-pub <hex>`.
-
----
 
 ## State layout
 
-### Client state
+### Client
 
 ```text
 /var/lib/iot-auth/client/
 ├── device_root.bin
-├── device_cert.pem
-├── device_key.pem
-├── ca_cert.pem
-└── server_pub.bin
+├── server_pub.bin
+└── role_cred.bin
 ```
 
-| File | Purpose |
-| --- | --- |
-| `device_root.bin` | Persistent device root secret |
-| `device_cert.pem` | Client certificate used during setup |
-| `device_key.pem` | Client certificate private key |
-| `ca_cert.pem` | Trusted CA certificate |
-| `server_pub.bin` | Pinned server Ristretto public key |
-
-### Server state
+### Server
 
 ```text
 /var/lib/iot-auth/server/
+├── server_sk.bin
 ├── registry.bin
 ├── registry.bak
-├── server_sk.bin
-├── server_cert.pem
-├── server_cert_key.pem
-├── ca_cert.pem
-├── ca_key.pem              # optional after export-ca-key
-└── server_pub.hex
+└── replay_cache.bin
 ```
 
-| File | Purpose |
-| --- | --- |
-| `registry.bin` | Enrolled device registry |
-| `registry.bak` | Registry backup |
-| `server_sk.bin` | Server static secret for protocol authentication |
-| `server_cert.pem` | Server certificate used during setup |
-| `server_cert_key.pem` | Server certificate private key |
-| `ca_cert.pem` | CA certificate |
-| `ca_key.pem` | CA private key used to issue certs; intended to be moved offline |
-| `server_pub.hex` | Hex copy of the server public key |
-
-### Generated files
-
-The automation script also uses:
+The v2 server registry uses 96-byte records:
 
 ```text
-/var/lib/iot-auth/generated/
-├── device_cert.pem
-├── device_key.pem
-├── device.csr
-├── server.csr
-└── ca_cert.srl
+device_id (32) || device_pub (32) || role_commitment (32)
 ```
 
-These are temporary or generated artifacts used while creating and installing certificates. The script securely removes the generated device private key after installation into the client state directory.
+This differs from earlier registry layouts and requires re-enrollment when upgrading from incompatible versions.
 
----
+## Dependencies
 
-## System dependencies
+The active client/server protocol code is based on **libsodium**. Build tooling in `zk-arche.sh` still links OpenSSL as a legacy dependency, but the current C source no longer uses the former X.509/certificate setup path.
 
-On Ubuntu or Raspberry Pi OS, install the build and runtime prerequisites first:
+Install the normal build prerequisites:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential gcc pkg-config git curl xxd openssl libssl-dev libsodium-dev
+sudo apt install -y build-essential gcc pkg-config libsodium-dev
 ```
 
-Why these are needed:
+If you use the helper script exactly as currently written, installing OpenSSL development packages also avoids linker/setup friction from its legacy build flags:
 
-- `libsodium-dev` is needed for Ristretto255 operations, X25519, hashing, AEAD, and secure memory helpers used by both `client.c` and `server.c`.
-- `libssl-dev` is needed for the OpenSSL-based certificate, transcript-signature, and chain-verification logic.
-- `gcc` is used to build `c_server`, `c_client`, and the helper program that derives the client identity from `device_root.bin`.
-
----
+```bash
+sudo apt install -y libssl-dev openssl
+```
 
 ## Build
 
-Build both binaries:
+Recommended:
 
 ```bash
 ./zk-arche.sh build
 ```
 
-Resulting binaries:
+Outputs:
 
 ```text
 ./c_server
 ./c_client
 ```
 
-Or compile manually:
+A minimal direct build for the active protocol source is:
 
 ```bash
-gcc -O2 -std=c11 -Wall -Wextra server.c -o c_server -lsodium -lssl -lcrypto -lpthread
-gcc -O2 -std=c11 -Wall -Wextra client.c -o c_client -lsodium -lssl -lcrypto
+gcc -O2 -std=c11 -Wall -Wextra -pedantic server.c -o c_server -lsodium -lpthread
+gcc -O2 -std=c11 -Wall -Wextra -pedantic client.c -o c_client -lsodium
 ```
 
----
-
-## Automation script
-
-The repository includes `zk-arche.sh`, which is the recommended way to manage state, generate demo certificates, run local tests, and execute setup/authentication flows. Its current command surface is:
-
-```text
-./zk-arche.sh build
-./zk-arche.sh make-certs
-./zk-arche.sh install-client-certs
-./zk-arche.sh check-server-certs
-./zk-arche.sh check-client-certs
-./zk-arche.sh export-ca-key
-./zk-arche.sh start-server <bind_addr> [opts]
-./zk-arche.sh server-local <bind_addr>
-./zk-arche.sh setup-device <server_ip:port> [--pairing-token <token>]
-./zk-arche.sh auth-device <server_ip:port>
-./zk-arche.sh show-pinned-key
-./zk-arche.sh pin-server <server_pub_hex>
-./zk-arche.sh status
-./zk-arche.sh client-local <server_ip:port> [--pairing-token <token>]
-./zk-arche.sh full-device-onboard <server_ip:port> [--pairing-token <token>]
-./zk-arche.sh reset-client
-./zk-arche.sh reset-server
-./zk-arche.sh reset-all
-```
-
-Notable behavior:
-
-- `make-certs` generates a CA, server certificate, and device certificate, then installs client cert material.
-- `export-ca-key` prints the CA private key and removes it from the server so it can be stored offline.
-- `status` reports current server state, client state, generated files, and derived identities.
-
----
-
-## Recommended local test flow
-
-This is the simplest end-to-end smoke test on one machine.
+## Recommended local v2 flow
 
 ### Terminal 1
 
 ```bash
 ./zk-arche.sh build
-./zk-arche.sh reset-all
-./zk-arche.sh make-certs
+sudo ./zk-arche.sh reset-all
+sudo ./zk-arche.sh init-rpk
 sudo ./zk-arche.sh server-local 127.0.0.1:4000
 ```
 
 ### Terminal 2
 
 ```bash
-sudo ./zk-arche.sh client-local 127.0.0.1:4000
+sudo ./zk-arche.sh client-local 127.0.0.1:4000 --allow-tofu-setup
 sudo ./zk-arche.sh auth-device 127.0.0.1:4000
 ```
 
----
+For a stronger deployment model, provision the server public key out of band and avoid TOFU.
 
-## Two-machine flow
-
-### Server host
-
-```bash
-./zk-arche.sh build
-./zk-arche.sh reset-all
-./zk-arche.sh make-certs
-sudo ./zk-arche.sh start-server 0.0.0.0:4000 --pairing
-```
-
-### Client host
-
-Copy or install the matching client materials so the client host has:
-
-- `/var/lib/iot-auth/client/device_root.bin`
-- `/var/lib/iot-auth/client/device_cert.pem`
-- `/var/lib/iot-auth/client/device_key.pem`
-- `/var/lib/iot-auth/client/ca_cert.pem`
-
-Then run:
-
-```bash
-sudo ./zk-arche.sh setup-device <server_ip>:4000
-sudo ./zk-arche.sh auth-device <server_ip>:4000
-```
-
-The setup step performs mutual-certificate onboarding and stores the operational pinned server key if present.
-
----
-
-## Pairing window and optional token
-
-The server can require an enrollment window and optionally a token.
-
-Start the server with pairing enabled:
-
-```bash
-sudo ./zk-arche.sh start-server 0.0.0.0:4000 --pairing
-```
-
-Start the server with a token and expiration window:
-
-```bash
-sudo ./zk-arche.sh start-server 0.0.0.0:4000 --pairing --pairing-token mysecrettoken --pairing-seconds 120
-```
-
-Run setup from the client with the same token:
-
-```bash
-sudo ./zk-arche.sh setup-device <server_ip>:4000 --pairing-token mysecrettoken
-```
-
-The server binary supports `--pairing`, `--pairing-token`, and `--pairing-seconds`, and the client supports `--pairing-token` for setup.
-
----
-
-## Manual server-key pinning
-
-If you want to pin the server public key out-of-band before setup:
-
-1. Print the server public key:
-
-```bash
-cd /var/lib/iot-auth/server
-sudo /path/to/c_server --print-pubkey
-```
-
-or use the helper script after the server key exists:
-
-```bash
-./zk-arche.sh pin-server <server_pub_hex>
-```
-
-2. Verify the pinned key on the client:
-
-```bash
-./zk-arche.sh show-pinned-key
-```
-
-The raw client binary also supports:
-
-```bash
-./c_client --pin-server-pub <server_pub_hex>
-```
-
----
-
-## Raw binary usage
+## Raw binary CLI
 
 ### Server
 
@@ -343,54 +190,45 @@ The raw client binary also supports:
 ```bash
 ./c_client --server 127.0.0.1:4000 --setup
 ./c_client --server 127.0.0.1:4000 --setup --pairing-token TOKEN
+./c_client --server 127.0.0.1:4000 --setup --allow-tofu-setup
 ./c_client --server 127.0.0.1:4000
-./c_client --pin-server-pub <server_pub_hex>
-./c_client --print-device-identity
+./c_client --pin-server-pub <64-hex-character-key>
+./c_client --print-identity
 ```
 
----
+## Current security behavior
 
-## Security notes
+The implementation includes:
 
-- The setup path is certificate-based; do not rely on the older bootstrap-secret README flow for this version.
-- `ca_key.pem` is intentionally convenient for demos, but it should not remain on the server in production. Run `./zk-arche.sh export-ca-key` and store the key offline.
-- The generated device private key is cleaned from `/var/lib/iot-auth/generated` after installation to avoid leaving a second copy behind.
-- The server rejects identity points and bounds encrypted payload sizes.
+- Ristretto point validation;
+- persistent replay-cache state;
+- private state-file permissions;
+- transcript-bound Schnorr proofs;
+- per-session pseudonyms;
+- role-commitment re-randomization;
+- anonymous role-set membership verification;
+- ephemeral Ristretto DH key establishment;
+- HKDF-based session derivation;
+- HMAC key confirmation; and
+- bounded socket I/O timeouts.
 
----
+## Removed/stale feature references
 
-## Quick troubleshooting
+Older versions of this repository used X.509 certificates, OpenSSL verification, X25519, ChaCha20-Poly1305, offline proof experiments, and continuity/reconnection mechanisms. Those descriptions are not representative of the current core client/server implementation.
 
-Check current state:
+`zk-arche.sh` still contains some legacy offline/continuity command text and state references. Treat its RPK initialization, server-key pinning, setup, authentication, state inspection, and reset flows as the reliable paths for the current binaries.
 
-```bash
-./zk-arche.sh status
-```
+## Research limitations
 
-Check certificate material only:
+- This is a research prototype and has not undergone a production-grade protocol or implementation audit.
+- AUTH payloads are currently plaintext at the application protocol layer over TCP; confidentiality would need to come from another transport/protection layer or a future protocol revision.
+- The server can identify the enrolled device after PID lookup; PID primarily avoids placing the stable identifier directly on the wire.
+- Current PID lookup scans enrolled records and recomputes PIDs, so lookup cost grows with registry size.
+- The allowed role set is compiled into both peers and must remain synchronized.
+- Secure server-key provisioning is external to the core protocol; TOFU is a bootstrap/debug tradeoff.
 
-```bash
-./zk-arche.sh check-server-certs
-./zk-arche.sh check-client-certs
-```
+## Repository scope
 
-Reset and rebuild demo state:
+This implementation is intended for constrained-device experimentation, C/Rust cross-language interoperability testing, privacy-preserving authentication research, role-authorization proof evaluation, and performance/security comparison before production hardening.
 
-```bash
-./zk-arche.sh reset-all
-./zk-arche.sh build
-./zk-arche.sh make-certs
-```
-
----
-
-# Research Notice
-
-This project is a **research prototype** for:
-
-* IoT authentication protocols
-* Zero-knowledge identification systems
-* Cross-language cryptographic interoperability
-* Evaluation on constrained devices (Raspberry Pi, embedded Linux)
-
-Not intended for production deployment without additional hardening.
+For the Rust implementation, see `firzen1912/ZK-ARCHE-Rust`. For benchmarking against EDHOC and mTLS, see `firzen1912/zk-arche-compare`.
